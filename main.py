@@ -18,20 +18,30 @@ def home():
     password=os.environ.get("MYSQL_PASSWORD"),
     database=os.environ.get("MYSQL_DATABASE")
     )
-
     # Create a cursor
     cursor = connection.cursor(pymysql.cursors.DictCursor)
 
     # Execute a query
-    cursor.execute('SELECT * FROM ArabicHadithTable')
-
+    cursor.execute("""SELECT arabicURN, collection, 
+                    hadithNumber, hadithText, 
+                    matchingEnglishURN FROM ArabicHadithTable""")
     # Fetch the results
-    results = cursor.fetchall()
+    arabicHadiths = cursor.fetchall()
 
     # Print the results
-    for row in results:
-        print(row.get("arabicURN"))
+    for row in arabicHadiths:
+        print(row.get("hadithText"))
 
+    cursor.execute("""SELECT englishURN, collection, 
+                    hadithNumber, hadithText, 
+                    matchingArabicURN FROM EnglishHadithTable""")
+    # Fetch the results
+    englishHadiths = cursor.fetchall()
+
+    # Print the results
+    for row in englishHadiths:
+        print(row.get("hadithText"))
+        
     # Close the connection
     connection.close()
 

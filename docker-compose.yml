@@ -7,7 +7,7 @@ services:
     volumes:
       - ./db:/docker-entrypoint-initdb.d/:ro
     env_file:
-      - .env.local
+      - .env
   web:
     depends_on:
       - "db"
@@ -18,4 +18,17 @@ services:
     ports:
       - "5000:5000"
     env_file:
-      - .env.local
+      - .env
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ES_STACK_VERSION}
+    container_name: elasticsearch
+    environment:
+      - node.name=elasticsearch
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    env_file:
+      - .env
+    ports:
+      - ${ES_PORT}:${ES_PORT}
+     
