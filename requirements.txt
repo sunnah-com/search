@@ -33,3 +33,4 @@ Werkzeug==1.0.1
 wrapt==1.12.1
 zipp==3.1.0
 elasticsearch==8.9.0
+requests==2.31.0
