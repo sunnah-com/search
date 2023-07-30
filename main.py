@@ -2,46 +2,41 @@ from flask import Flask
 import pymysql
 import os
 from dotenv import load_dotenv
+import math
+from elasticsearch import Elasticsearch, helpers
 
 load_dotenv(".env.local")
 
 
 
 app = Flask(__name__)
+es_client = Elasticsearch(f"http://host.docker.internal:{os.environ.get('ES_PORT')}",
+                        http_auth=('elastic', os.environ.get("ELASTIC_PASSWORD")))
 
 @app.route("/", methods=["GET"])
 def home():
-    # Connect to the database
     connection = pymysql.connect(
-    host=os.environ.get("MYSQL_HOST"),
-    user=os.environ.get("MYSQL_USER"),
-    password=os.environ.get("MYSQL_PASSWORD"),
-    database=os.environ.get("MYSQL_DATABASE")
+        host=os.environ.get("MYSQL_HOST"),
+        user=os.environ.get("MYSQL_USER"),
+        password=os.environ.get("MYSQL_PASSWORD"),
+        database=os.environ.get("MYSQL_DATABASE")
     )
-    # Create a cursor
     cursor = connection.cursor(pymysql.cursors.DictCursor)
 
-    # Execute a query
     cursor.execute("""SELECT arabicURN, collection, 
                     hadithNumber, hadithText, 
                     matchingEnglishURN FROM ArabicHadithTable""")
-    # Fetch the results
     arabicHadiths = cursor.fetchall()
+    helpers.bulk(es_client, arabicHadiths, index="arabic")
 
-    # Print the results
-    for row in arabicHadiths:
-        print(row.get("hadithText"))
+
 
     cursor.execute("""SELECT englishURN, collection, 
                     hadithNumber, hadithText, 
                     matchingArabicURN FROM EnglishHadithTable""")
-    # Fetch the results
     englishHadiths = cursor.fetchall()
+    helpers.bulk(es_client, englishHadiths, index="english")
 
-    # Print the results
-    for row in englishHadiths:
-        print(row.get("hadithText"))
-        
     # Close the connection
     connection.close()
 
