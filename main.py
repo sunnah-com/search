@@ -52,21 +52,14 @@ def index():
 
 @app.route("/<language>/search", methods=["GET"])
 def search(language):
-    query = request.args.get("query")
-    # fields to query on
-    # TODO: hadithNumber cant be default field as is, errors out with string query
-    fields = request.args.get("fields", ["collection", "hadithText"])
-    req_body = {
-            "query":{   
-                "multi_match" : {
-                "query":  query, 
-                "fields": fields
+    query = request.args.get("q")
+    query_dsl = {
+                "query_string" : {
+                    "query":  query, 
+                    "default_field": "hadithText"
+                    }
                 }
-            }
-        }
-    headers = {'Content-Type': 'application/json'}
-
-    return requests.get(f"{es_base_url}/{language}/_search", headers=headers, auth=es_auth, data=json.dumps(req_body)).json()
+    return json.dumps(es_client.search(index=language, query = query_dsl, highlight={"fields":{"hadithText":{}}}).body)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0")
