@@ -3,7 +3,6 @@ import pymysql
 import os
 from dotenv import load_dotenv
 import math
-import requests
 import json
 
 from elasticsearch import Elasticsearch, helpers
@@ -22,8 +21,12 @@ def home():
     return "<h1>Welcome to sunnah.com API.</h1>"
 
 
+# TODO: Is this super rudimentary auth sufficient?
 @app.route("/index", methods=["GET"])
 def index():
+    if request.args.get("password") != os.environ.get("ELASTIC_PASSWORD"):
+        return "Must provide valid password to index", 401
+    
     connection = pymysql.connect(
         host=os.environ.get("MYSQL_HOST"),
         user=os.environ.get("MYSQL_USER"),
