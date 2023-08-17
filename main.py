@@ -81,7 +81,11 @@ def search(language):
     }
     return jsonify(
         es_client.search(
-            index=language, query=query_dsl, from_ = request.args.get("from", 0), size = request.args.get("size", 10),  highlight={"fields": {"hadithText": {}}}
+            index=language,
+            query=query_dsl,
+            from_=request.args.get("from", 0),
+            size=request.args.get("size", 10),
+            highlight={"number_of_fragments": 0, "fields": {"hadithText": {}}},
         ).body
     )
 
