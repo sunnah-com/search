@@ -1,4 +1,4 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import pymysql
 import os
 from dotenv import load_dotenv
@@ -26,7 +26,7 @@ def home():
 def index():
     if request.args.get("password") != os.environ.get("ELASTIC_PASSWORD"):
         return "Must provide valid password to index", 401
-    
+
     connection = pymysql.connect(
         host=os.environ.get("MYSQL_HOST"),
         user=os.environ.get("MYSQL_USER"),
@@ -58,8 +58,14 @@ def index():
     connection.close()
 
     return {
-        "english": {"success_count": englishSuccessCount, "failed": json.dumps(englishErrors)},
-        "arabic": {"success_count": arabicSuccessCount, "failed": json.dumps(arabicErrors)},
+        "english": {
+            "success_count": englishSuccessCount,
+            "failed": json.dumps(englishErrors),
+        },
+        "arabic": {
+            "success_count": arabicSuccessCount,
+            "failed": json.dumps(arabicErrors),
+        },
     }
 
 
@@ -67,10 +73,15 @@ def index():
 def search(language):
     query = request.args.get("q")
     # TODO: 'query_string' is strict and does not allow syntax erorrs. Compare to current behavior
-    query_dsl = {"query_string": {"query": query, "default_field": "hadithText"}}
-    return json.dumps(
+    query_dsl = {
+        "query_string": {
+            "query": query,
+            "default_field": "hadithText",
+        }
+    }
+    return jsonify(
         es_client.search(
-            index=language, query=query_dsl, highlight={"fields": {"hadithText": {}}}
+            index=language, query=query_dsl, from_ = request.args.get("from", 0), size = request.args.get("size", 10),  highlight={"fields": {"hadithText": {}}}
         ).body
     )
 
