@@ -31,14 +31,15 @@ def index():
         database=os.environ.get("MYSQL_DATABASE"),
     )
     cursor = connection.cursor(pymysql.cursors.DictCursor)
-
     cursor.execute(
         """SELECT arabicURN, collection, 
                     hadithNumber, hadithText, 
                     matchingEnglishURN FROM ArabicHadithTable"""
     )
     arabicHadiths = cursor.fetchall()
-    helpers.bulk(es_client, arabicHadiths, index="arabic")
+    arabicSuccessCount, arabicErrors = helpers.bulk(
+        es_client, arabicHadiths, index="arabic"
+    )
 
     cursor.execute(
         """SELECT englishURN, collection, 
@@ -46,17 +47,23 @@ def index():
                     matchingArabicURN FROM EnglishHadithTable"""
     )
     englishHadiths = cursor.fetchall()
-    helpers.bulk(es_client, englishHadiths, index="english")
+    englishSuccessCount, englishErrors = helpers.bulk(
+        es_client, englishHadiths, index="english"
+    )
 
     # Close the connection
     connection.close()
 
-    return "TODO"
+    return {
+        "english": {"success_count": englishSuccessCount, "failed": json.dumps(englishErrors)},
+        "arabic": {"success_count": arabicSuccessCount, "failed": json.dumps(arabicErrors)},
+    }
 
 
 @app.route("/<language>/search", methods=["GET"])
 def search(language):
     query = request.args.get("q")
+    # TODO: 'query_string' is strict and does not allow syntax erorrs. Compare to current behavior
     query_dsl = {"query_string": {"query": query, "default_field": "hadithText"}}
     return json.dumps(
         es_client.search(
