@@ -1,23 +1,14 @@
 version: '3'
 
 services:
-  db:
-    image: mysql:5.7.22
-    command: --default-authentication-plugin=mysql_native_password
-    volumes:
-      - ./db:/docker-entrypoint-initdb.d/:ro
-    env_file:
-      - .env
   web:
     depends_on:
-      - "db"
       - "elasticsearch"
     build: .
-    command: flask run --host=0.0.0.0
-    volumes:
-      - .:/code
+    command: uwsgi --ini uwsgi.ini
     ports:
-      - "5000:5000"
+      - "5001:5001"
+    restart: on-failure
     env_file:
       - .env
   elasticsearch:

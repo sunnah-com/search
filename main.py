@@ -12,7 +12,7 @@ load_dotenv(".env.local")
 
 app = Flask(__name__)
 es_auth = ("elastic", os.environ.get("ELASTIC_PASSWORD"))
-es_base_url = f"http://host.docker.internal:{os.environ.get('ES_PORT')}"
+es_base_url = f"http://elasticsearch:{os.environ.get('ES_PORT')}"
 es_client = Elasticsearch(es_base_url, http_auth=es_auth)
 
 
