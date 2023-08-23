@@ -22,15 +22,51 @@ def home():
 
 
 def create_and_update_index(index_name, documents, fields_to_not_index):
+    # Settings for suggestions
+    settings = {
+        "index": {
+            "number_of_shards": 1,
+            "analysis": {
+                "analyzer": {
+                    "trigram": {
+                        "type": "custom",
+                        "tokenizer": "standard",
+                        "filter": ["lowercase", "shingle"],
+                    },
+                    "reverse": {
+                        "type": "custom",
+                        "tokenizer": "standard",
+                        "filter": ["lowercase", "reverse"],
+                    },
+                },
+                "filter": {
+                    "shingle": {
+                        "type": "shingle",
+                        "min_shingle_size": 2,
+                        "max_shingle_size": 3,
+                    }
+                },
+            },
+        }
+    }
     mappings = {
         "properties": {
             field: {"type": "text", "index": False} for field in fields_to_not_index
         }
+        | {
+            "hadithText": {
+                "type": "text",
+                "fields": {
+                    "trigram": {"type": "text", "analyzer": "trigram"},
+                    "reverse": {"type": "text", "analyzer": "reverse"},
+                },
+            }
+        }
     }
     if es_client.indices.exists(index=index_name):
         es_client.indices.delete(index=index_name)
-    es_client.indices.create(index=index_name, mappings=mappings)
-    successCount, errors = helpers.bulk(es_client, documents, index=index_name)
+    es_client.indices.create(index=index_name, mappings=mappings, settings=settings)
+    successCount, errors = dumps(helpers.bulk(es_client, documents, index=index_name))
     return successCount, errors
 
 
@@ -99,6 +135,29 @@ def search(language):
             from_=request.args.get("from", 0),
             size=request.args.get("size", 10),
             highlight={"number_of_fragments": 0, "fields": {"hadithText": {}}},
+            suggest={
+                "text": query,
+                "simple_phrase": {
+                    "phrase": {
+                        "field": "hadithText.trigram",
+                        "size": 1,
+                        "gram_size": 3,
+                        "direct_generator": [
+                            {"field": "hadithText.trigram", "suggest_mode": "always"}
+                        ],
+                        "highlight": {"pre_tag": "<em>", "post_tag": "</em>"},
+                        "collate": {
+                            "query": {
+                                "source": {
+                                    "match": {"hadithText": "\{\{suggestion\}\}"}
+                                }
+                            },
+                            # Only return suggestions with a query match
+                            "prune": False,
+                        },
+                    }
+                },
+            },
         ).body
     )
 
