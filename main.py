@@ -24,7 +24,7 @@ def home():
 def create_and_update_index(index_name, documents, fields_to_not_index):
     mappings = {
         "properties": {
-            field: {"type": "text", "index": False} for field in fields_to_not_unindex
+            field: {"type": "text", "index": False} for field in fields_to_not_index
         }
     }
     if es_client.indices.exists(index=index_name):
