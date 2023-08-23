@@ -21,10 +21,22 @@ def home():
     return "<h1>Welcome to sunnah.com API.</h1>"
 
 
-# TODO: Is this super rudimentary auth sufficient?
+def create_and_update_index(index_name, documents, fields_to_not_index):
+    mappings = {
+        "properties": {
+            field: {"type": "text", "index": False} for field in fields_to_not_unindex
+        }
+    }
+    if es_client.indices.exists(index=index_name):
+        es_client.indices.delete(index=index_name)
+    es_client.indices.create(index=index_name, mappings=mappings)
+    successCount, errors = helpers.bulk(es_client, documents, index=index_name)
+    return successCount, errors
+
+
 @app.route("/index", methods=["GET"])
 def index():
-    if request.args.get("password") != os.environ.get("ELASTIC_PASSWORD"):
+    if request.args.get("password") != os.environ.get("INDEXING_PASSWORD"):
         return "Must provide valid password to index", 401
 
     connection = pymysql.connect(
@@ -34,27 +46,28 @@ def index():
         database=os.environ.get("MYSQL_DATABASE"),
     )
     cursor = connection.cursor(pymysql.cursors.DictCursor)
+    # Arabic Hadiths
     cursor.execute(
         """SELECT arabicURN, collection, 
                     hadithNumber, hadithText, 
                     matchingEnglishURN FROM ArabicHadithTable"""
     )
     arabicHadiths = cursor.fetchall()
-    arabicSuccessCount, arabicErrors = helpers.bulk(
-        es_client, arabicHadiths, index="arabic"
+    arabicSuccessCount, arabicErrors = create_and_update_index(
+        "arabic", arabicHadiths, ["arabicURN", "matchingEnglishURN"]
     )
 
+    # English Hadiths
     cursor.execute(
         """SELECT englishURN, collection, 
                     hadithNumber, hadithText, 
                     matchingArabicURN FROM EnglishHadithTable"""
     )
     englishHadiths = cursor.fetchall()
-    englishSuccessCount, englishErrors = helpers.bulk(
-        es_client, englishHadiths, index="english"
+    englishSuccessCount, englishErrors = create_and_update_index(
+        "english", englishHadiths, ["englishURN", "matchingArabicURN"]
     )
 
-    # Close the connection
     connection.close()
 
     return {
