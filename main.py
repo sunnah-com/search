@@ -33,11 +33,6 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
                         "tokenizer": "standard",
                         "filter": ["lowercase", "shingle"],
                     },
-                    "reverse": {
-                        "type": "custom",
-                        "tokenizer": "standard",
-                        "filter": ["lowercase", "reverse"],
-                    },
                 },
                 "filter": {
                     "shingle": {
