@@ -53,12 +53,13 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
         "properties": {
             field: {"type": "text", "index": False} for field in fields_to_not_index
         }
-        | {
+        | 
+        # Configurating field for suggestions
+        {
             "hadithText": {
                 "type": "text",
                 "fields": {
                     "trigram": {"type": "text", "analyzer": "trigram"},
-                    "reverse": {"type": "text", "analyzer": "reverse"},
                 },
             }
         }
@@ -137,7 +138,7 @@ def search(language):
             highlight={"number_of_fragments": 0, "fields": {"hadithText": {}}},
             suggest={
                 "text": query,
-                "simple_phrase": {
+                "query": {
                     "phrase": {
                         "field": "hadithText.trigram",
                         "size": 1,
