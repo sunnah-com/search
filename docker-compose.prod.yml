@@ -19,6 +19,9 @@ services:
       - discovery.type=single-node
       - xpack.security.enabled=true
       - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    volumes:
+      # TODO: This to be configurable perhaps
+      - ./config/synonyms.txt:/usr/share/elasticsearch/config/synonyms.txt
     env_file:
       - .env
      

@@ -22,7 +22,6 @@ def home():
 
 
 def create_and_update_index(index_name, documents, fields_to_not_index):
-    # Settings for suggestions
     settings = {
         "index": {
             "number_of_shards": 1,
@@ -33,12 +32,23 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
                         "tokenizer": "standard",
                         "filter": ["lowercase", "shingle"],
                     },
+                    "synonym": {
+                        "type": "custom",
+                        "tokenizer": "standard",
+                        "filter": ["lowercase", "synonyms_filter"],
+                    },
                 },
                 "filter": {
+                    # 2-3 word shingles for better suggestions
                     "shingle": {
                         "type": "shingle",
                         "min_shingle_size": 2,
                         "max_shingle_size": 3,
+                    },
+                    "synonyms_filter": {
+                        "type": "synonym",
+                        "lenient": True,
+                        "synonyms_path": "synonyms.txt"
                     }
                 },
             },
@@ -53,6 +63,7 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
         {
             "hadithText": {
                 "type": "text",
+                "analyzer": "synonym",
                 "fields": {
                     "trigram": {"type": "text", "analyzer": "trigram"},
                 },
@@ -62,7 +73,7 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
     if es_client.indices.exists(index=index_name):
         es_client.indices.delete(index=index_name)
     es_client.indices.create(index=index_name, mappings=mappings, settings=settings)
-    successCount, errors = dumps(helpers.bulk(es_client, documents, index=index_name))
+    successCount, errors = helpers.bulk(es_client, documents, index=index_name)
     return successCount, errors
 
 
