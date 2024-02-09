@@ -105,8 +105,6 @@ def index():
         password=os.environ.get("MYSQL_PASSWORD"),
         database=os.environ.get("MYSQL_DATABASE"),
     )
-    hadithsToIndex = []
-
     cursor = connection.cursor(pymysql.cursors.DictCursor)
     # Arabic Hadiths
     cursor.execute(
@@ -139,11 +137,8 @@ def index():
         if englishHadith["urn"] not in matchingArabicHadiths:
            continue
         matchingArabic = matchingArabicHadiths[englishHadith["urn"]]
-        englishHadith = {
-            **englishHadith,
-            "arabicText": matchingArabic["arabicText"],
-            "hadithNumber": matchingArabic["hadithNumber"],
-        }
+        englishHadith["arabicText"] = matchingArabic["arabicText"]
+        englishHadith["hadithNumber"] = matchingArabic["hadithNumber"]
         
     englishSuccessCount, englishErrors = create_and_update_index(
         "english", englishHadiths, ["urn", "matchingArabicURN"]
@@ -165,7 +160,6 @@ def index():
 
 @app.route("/<language>/search", methods=["GET"])
 def search(language):
-    print(language)
     query = request.args.get("q")
     # TODO: 'query_string' is strict and does not allow syntax erorrs. Compare to current behavior
     query_dsl = {
