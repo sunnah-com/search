@@ -30,20 +30,29 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
                     "trigram": {
                         "type": "custom",
                         "tokenizer": "standard",
-                         "char_filter": ["html_strip"],
+                        "char_filter": ["html_strip"],
                         "filter": ["lowercase", "stop", "shingle", "stemmer", "stop"],
                     },
                     "synonym": {
                         "type": "custom",
                         "tokenizer": "standard",
                         "char_filter": ["html_strip"],
-                        "filter": ["lowercase", "stop",  "synonyms_filter", "stemmer", ],
+                        "filter": [
+                            "lowercase",
+                            "stop",
+                            "synonyms_filter",
+                            "stemmer",
+                        ],
                     },
-                    "arabic":{
+                    "arabic": {
                         "tokenizer": "standard",
                         "char_filter": ["html_strip"],
-                        "filter": ["lowercase", "stop", "stemmer", ],
-                    }
+                        "filter": [
+                            "lowercase",
+                            "stop",
+                            "stemmer",
+                        ],
+                    },
                 },
                 "filter": {
                     # 2-3 word shingles for better suggestions
@@ -76,13 +85,7 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
                 },
             }
         }
-        |
-        {
-            "arabicText": {
-                "type": "text",
-                "analyzer": "arabic"
-            }
-        }
+        | {"arabicText": {"type": "text", "analyzer": "arabic"}}
     }
     if es_client.indices.exists(index=index_name):
         es_client.indices.delete(index=index_name)
@@ -102,56 +105,74 @@ def index():
         password=os.environ.get("MYSQL_PASSWORD"),
         database=os.environ.get("MYSQL_DATABASE"),
     )
+    hadithsToIndex = []
+
     cursor = connection.cursor(pymysql.cursors.DictCursor)
     # Arabic Hadiths
     cursor.execute(
-        """SELECT collection, hadithNumber, hadithText, 
+        """SELECT arabicURN as urn, collection, hadithNumber, hadithText as arabicText, 
                     matchingEnglishURN FROM ArabicHadithTable"""
     )
     arabicHadiths = cursor.fetchall()
 
+    arabicOnlyHadiths = []
     matchingArabicHadiths = {}
-    for hadith in arabicHadiths:
-        matchingArabicHadiths[hadith["matchingEnglishURN"]] = hadith
+    for arabicHadith in arabicHadiths:
+        if arabicHadith["matchingEnglishURN"] == 0:
+            arabicOnlyHadiths.append(arabicHadith)
+        else:
+            matchingArabicHadiths[arabicHadith["matchingEnglishURN"]] = arabicHadith
+    
+    arabicSuccessCount, arabicErrors = create_and_update_index(
+        "arabic", arabicOnlyHadiths, ["urn", "matchingEnglishURN"]
+    )
 
     # English Hadiths
     cursor.execute(
-        """SELECT englishURN, collection, hadithText, 
+        """SELECT englishURN as urn, collection, hadithText, 
                     matchingArabicURN FROM EnglishHadithTable"""
     )
     englishHadiths = cursor.fetchall()
 
     # Add arabic text and hadithNumber to english hadith
     for englishHadith in englishHadiths:
-        if englishHadith["englishURN"] not in matchingArabicHadiths:
-            continue
-        matchingArabic = matchingArabicHadiths[englishHadith["englishURN"]]
-        englishHadith["arabicText"] = matchingArabic["hadithText"]
-        englishHadith["hadithNumber"] = matchingArabic["hadithNumber"]
-
+        if englishHadith["urn"] not in matchingArabicHadiths:
+           continue
+        matchingArabic = matchingArabicHadiths[englishHadith["urn"]]
+        englishHadith = {
+            **englishHadith,
+            "arabicText": matchingArabic["arabicText"],
+            "hadithNumber": matchingArabic["hadithNumber"],
+        }
+        
     englishSuccessCount, englishErrors = create_and_update_index(
-        "english", englishHadiths, ["englishURN", "matchingArabicURN"]
+        "english", englishHadiths, ["urn", "matchingArabicURN"]
     )
 
     connection.close()
 
     return {
-        "english": {
+        "englishAndCombined": {
             "success_count": englishSuccessCount,
             "failed": json.dumps(englishErrors),
-        }
+        },
+       "arabic": {
+            "success_count": arabicSuccessCount,
+            "failed": json.dumps(arabicErrors),
+        },
     }
 
 
 @app.route("/<language>/search", methods=["GET"])
 def search(language):
+    print(language)
     query = request.args.get("q")
     # TODO: 'query_string' is strict and does not allow syntax erorrs. Compare to current behavior
     query_dsl = {
         "query_string": {
             "query": query,
-            "type":   "cross_fields",
-            "fields": ["hadithNumber^2","hadithText", "arabicText","collection^2"],
+            "type": "cross_fields",
+            "fields": ["hadithNumber^2", "hadithText", "arabicText", "collection^2"],
         }
     }
     return jsonify(
@@ -160,7 +181,7 @@ def search(language):
             query=query_dsl,
             from_=request.args.get("from", 0),
             size=request.args.get("size", 10),
-            highlight={"number_of_fragments": 0, "fields": {"*":{}}},
+            highlight={"number_of_fragments": 0, "fields": {"*": {}}},
             suggest={
                 "text": query,
                 "query": {
