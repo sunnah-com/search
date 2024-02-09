@@ -1,0 +1,36 @@
+version: '3'
+
+services:
+  db:
+    image: mysql:5.7.22
+    command: --default-authentication-plugin=mysql_native_password
+    volumes:
+      - ./db:/docker-entrypoint-initdb.d/:ro
+    env_file:
+      - .env
+  web:
+    depends_on:
+      - "db"
+      - "elasticsearch"
+    build: .
+    command: flask run --host=0.0.0.0
+    volumes:
+      - .:/code
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ES_STACK_VERSION}
+    container_name: elasticsearch
+    environment:
+      - node.name=elasticsearch
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - cluster.routing.allocation.disk.threshold_enabled=false
+    volumes:
+      - ./config/synonyms.txt:/usr/share/elasticsearch/config/synonyms.txt
+    env_file:
+      - .env
+     

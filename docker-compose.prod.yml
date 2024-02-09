@@ -1,0 +1,29 @@
+version: '3'
+
+services:
+  web:
+    depends_on:
+      - "elasticsearch"
+    build:
+      context: .
+      dockerfile: Dockerfile-prod
+    command: uwsgi --ini uwsgi.ini
+    ports:
+      - "5001:5001"
+    restart: on-failure
+    env_file:
+      - .env
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ES_STACK_VERSION}
+    container_name: elasticsearch
+    environment:
+      - node.name=elasticsearch
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    volumes:
+      # TODO: This to be configurable perhaps
+      - ./config/synonyms.txt:/usr/share/elasticsearch/config/synonyms.txt
+    env_file:
+      - .env
+     
