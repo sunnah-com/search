@@ -32,7 +32,7 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
                         "type": "custom",
                         "tokenizer": "standard",
                         "char_filter": ["html_strip"],
-                        "filter": ["lowercase", "stop", "shingle", "stemmer", "stop"],
+                        "filter": ["lowercase", "stop", "shingle"],
                     },
                     "synonym": {
                         "type": "custom",
