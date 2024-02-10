@@ -1,3 +1,4 @@
+import time
 from flask import Flask, request, jsonify
 import pymysql
 import os
@@ -96,6 +97,7 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
 
 @app.route("/index", methods=["GET"])
 def index():
+    start = time.time()
     if request.args.get("password") != os.environ.get("INDEXING_PASSWORD"):
         return "Must provide valid password to index", 401
 
@@ -109,7 +111,7 @@ def index():
     # Arabic Hadiths
     cursor.execute(
         """SELECT arabicURN as urn, collection, hadithNumber, hadithText as arabicText, 
-                    matchingEnglishURN FROM ArabicHadithTable"""
+                    matchingEnglishURN, "ar" as lang FROM ArabicHadithTable"""
     )
     arabicHadiths = cursor.fetchall()
 
@@ -121,14 +123,11 @@ def index():
         else:
             matchingArabicHadiths[arabicHadith["matchingEnglishURN"]] = arabicHadith
     
-    arabicSuccessCount, arabicErrors = create_and_update_index(
-        "arabic", arabicOnlyHadiths, ["urn", "matchingEnglishURN"]
-    )
 
     # English Hadiths
     cursor.execute(
         """SELECT englishURN as urn, collection, hadithText, 
-                    matchingArabicURN FROM EnglishHadithTable"""
+                    matchingArabicURN, "en" as lang FROM EnglishHadithTable"""
     )
     englishHadiths = cursor.fetchall()
 
@@ -140,21 +139,20 @@ def index():
         englishHadith["arabicText"] = matchingArabic["arabicText"]
         englishHadith["hadithNumber"] = matchingArabic["hadithNumber"]
         
-    englishSuccessCount, englishErrors = create_and_update_index(
-        "english", englishHadiths, ["urn", "matchingArabicURN"]
+    indexingSuccessCount, indexingErrors = create_and_update_index(
+        "english", englishHadiths + arabicOnlyHadiths, ["urn", "matchingArabicURN", "lang"]
     )
 
     connection.close()
-
     return {
-        "englishAndCombined": {
-            "success_count": englishSuccessCount,
-            "failed": json.dumps(englishErrors),
+        "all_hadith_index_results": {
+            "success_count": indexingSuccessCount,
+            "failed": json.dumps(indexingErrors),
         },
-       "arabic": {
-            "success_count": arabicSuccessCount,
-            "failed": json.dumps(arabicErrors),
+       "arabic_only": {
+            "count": len(arabicOnlyHadiths),
         },
+        "timeInSeconds": time.time() - start
     }
 
 
