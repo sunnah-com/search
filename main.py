@@ -45,7 +45,7 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
                             "stemmer",
                         ],
                     },
-                    "rebuilt_arabic": {
+                    "custom_arabic": {
                         "tokenizer":  "standard",
                         "char_filter": ["html_strip"],
                         "filter": [
@@ -96,7 +96,7 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
                 },
             }
         }
-        | {"arabicText": {"type": "text", "analyzer": "arabic"}}
+        | {"arabicText": {"type": "text", "analyzer": "custom_arabic"}}
     }
     if es_client.indices.exists(index=index_name):
         es_client.indices.delete(index=index_name)
