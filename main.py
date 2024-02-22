@@ -45,15 +45,17 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
                             "stemmer",
                         ],
                     },
-                    "arabic": {
-                        "tokenizer": "standard",
+                    "rebuilt_arabic": {
+                        "tokenizer":  "standard",
                         "char_filter": ["html_strip"],
                         "filter": [
                             "lowercase",
-                            "stop",
-                            "stemmer",
-                        ],
-                    },
+                            "decimal_digit",
+                            "arabic_stop",
+                            "arabic_normalization",
+                            "arabic_stemmer"
+                        ]
+                    }
                 },
                 "filter": {
                     # 2-3 word shingles for better suggestions
@@ -66,6 +68,14 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
                         "type": "synonym",
                         "lenient": True,
                         "synonyms_path": "synonyms.txt",
+                    },
+                    "arabic_stemmer": {
+                        "type":       "stemmer",
+                        "language":   "arabic"
+                    },
+                    "arabic_stop": {
+                        "type":       "stop",
+                        "stopwords":  "_arabic_" 
                     },
                 },
             },
