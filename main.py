@@ -105,6 +105,25 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
     successCount, errors = helpers.bulk(es_client, documents, index=index_name)
     return successCount, errors
 
+def get_suggest_query(suggest_field):
+    return {
+        "field": suggest_field,
+        "size": 3,
+        "gram_size": 3,
+        "direct_generator": [
+            {"field": suggest_field, "suggest_mode": "missing"}
+        ],
+        "highlight": {"pre_tag": "<em>", "post_tag": "</em>"},
+        "collate": {
+            "query": {
+                "source": {
+                    "match": {suggest_field: "{{suggestion}}"}
+                }
+            },
+            # Only return suggestions with a query match
+            "prune": False,
+        },
+    }
 
 @app.route("/index", methods=["GET"])
 def index():
@@ -185,28 +204,14 @@ def search(language):
             from_=request.args.get("from", 0),
             size=request.args.get("size", 10),
             highlight={"number_of_fragments": 0, "fields": {"*": {}}},
-            suggest={
+            suggest= {
                 "text": query,
-                "query": {
-                    "phrase": {
-                        "field": "hadithText.trigram",
-                        "size": 1,
-                        "gram_size": 3,
-                        "direct_generator": [
-                            {"field": "hadithText.trigram", "suggest_mode": "always"}
-                        ],
-                        "highlight": {"pre_tag": "<em>", "post_tag": "</em>"},
-                        "collate": {
-                            "query": {
-                                "source": {
-                                    "match": {"hadithText": "\{\{suggestion\}\}"}
-                                }
-                            },
-                            # Only return suggestions with a query match
-                            "prune": False,
-                        },
-                    }
-                },
+                "english": {
+                     "phrase": get_suggest_query("hadithText.trigram"),
+                 },
+                "arabic": {
+                     "phrase": get_suggest_query("arabicText"),
+                 },
             },
         ).body
     )
