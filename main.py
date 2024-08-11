@@ -51,9 +51,9 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
                         "filter": [
                             "lowercase",
                             "decimal_digit",
-                            "arabic_stop",
                             "arabic_normalization",
-                            "arabic_stemmer"
+                            "arabic_stemmer",
+                            "shingle"
                         ]
                     }
                 },
@@ -63,6 +63,7 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
                         "type": "shingle",
                         "min_shingle_size": 2,
                         "max_shingle_size": 3,
+                        "output_unigrams": True
                     },
                     "synonyms_filter": {
                         "type": "synonym",
