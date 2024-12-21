@@ -221,7 +221,7 @@ def search(language):
         "query_string": {
             "query": query,
             "type": "cross_fields",
-            "fields": ["hadithNumber^2", "hadithText", "arabicText", "collection^10"],
+            "fields": ["hadithNumber^2", "hadithText", "arabicText", "collection^2"],
             "boost": 1
         }
     }
