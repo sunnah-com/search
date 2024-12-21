@@ -187,21 +187,47 @@ def index():
     }
 
 
+def get_filter_from_args(args):
+    filters = []
+    collection = args.get("collection")
+    if collection:
+        filters.append({"term": {"collection": collection}})
+
+    grade = args.get("grade")
+    if grade:
+        filters.append({"term": {"grade": grade}})
+    return filters
+
 @app.route("/<language>/search", methods=["GET"])
 def search(language):
     query = request.args.get("q")
-    # TODO: 'query_string' is strict and does not allow syntax erorrs. Compare to current behavior
-    query_dsl = {
+    filter = get_filter_from_args(request.args)
+
+    # TODO: Query string has a strict syntax and can cause failures when character like ":" appear in a search query. 
+    # It's not recomended for search. But it's what allows us to do "AND collection:bukhari" or "AND hadithNumber:123" in the search bar
+    # Could be better to expose all those fields as filters instead and move away from query_string
+    query_string = {
         "query_string": {
             "query": query,
             "type": "cross_fields",
             "fields": ["hadithNumber^2", "hadithText", "arabicText", "collection^2"],
+        }               
+    }
+    
+    # Complete query with must (for search) and filter (for exact matches, collection, grade, etc)
+    bool_query = {
+        "bool": {
+            "filter": filter,
+            "must": [
+                query_string
+            ],
         }
     }
+    
     return jsonify(
         es_client.search(
             index=language,
-            query=query_dsl,
+            query=bool_query,
             from_=request.args.get("from", 0),
             size=request.args.get("size", 10),
             highlight={"number_of_fragments": 0, "fields": {"*": {}}},
