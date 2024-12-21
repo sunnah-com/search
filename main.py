@@ -189,13 +189,13 @@ def index():
 
 def get_filter_from_args(args):
     filters = []
-    collection = args.get("collection")
+    collection = args.getlist("collection")
     if collection:
-        filters.append({"term": {"collection": collection}})
+        filters.append({"terms": {"collection": collection}})
 
-    grade = args.get("grade")
+    grade = args.getlist("grade")
     if grade:
-        filters.append({"term": {"grade": grade}})
+        filters.append({"terms": {"grade": grade}})
     return filters
 
 @app.route("/<language>/search", methods=["GET"])
