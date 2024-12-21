@@ -141,7 +141,7 @@ def index():
     # Arabic Hadiths
     cursor.execute(
         """SELECT arabicURN as urn, collection, hadithNumber, hadithText as arabicText, 
-                    matchingEnglishURN, "ar" as lang FROM ArabicHadithTable"""
+                    matchingEnglishURN, "ar" as lang, grade1 as grade FROM ArabicHadithTable"""
     )
     arabicHadiths = cursor.fetchall()
 
@@ -157,7 +157,7 @@ def index():
     # English Hadiths
     cursor.execute(
         """SELECT englishURN as urn, collection, hadithText, 
-                    matchingArabicURN, "en" as lang FROM EnglishHadithTable"""
+                    matchingArabicURN, "en" as lang, grade1 as grade FROM EnglishHadithTable"""
     )
     englishHadiths = cursor.fetchall()
 
@@ -167,6 +167,7 @@ def index():
            continue
         matchingArabic = matchingArabicHadiths[englishHadith["urn"]]
         englishHadith["arabicText"] = matchingArabic["arabicText"]
+        englishHadith["arabicGrade"] = matchingArabic["grade"]
         englishHadith["hadithNumber"] = matchingArabic["hadithNumber"]
         
     indexingSuccessCount, indexingErrors = create_and_update_index(
