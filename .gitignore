@@ -1,3 +1,4 @@
 db/01-hadithTable.sql
 .env
 __pycache__
+.venv

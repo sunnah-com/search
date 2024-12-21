@@ -3,10 +3,10 @@ from flask import Flask, request, jsonify
 import pymysql
 import os
 from dotenv import load_dotenv
-import math
 import json
 
 from elasticsearch import Elasticsearch, helpers
+from elasticsearch.client import InferenceClient
 
 load_dotenv(".env.local")
 
@@ -14,13 +14,28 @@ load_dotenv(".env.local")
 app = Flask(__name__)
 es_auth = ("elastic", os.environ.get("ELASTIC_PASSWORD"))
 es_base_url = f"http://elasticsearch:{os.environ.get('ES_PORT')}"
-es_client = Elasticsearch(es_base_url, http_auth=es_auth)
-
+es_client = Elasticsearch(es_base_url, http_auth=es_auth, timeout=30)
+if_client = InferenceClient(client=es_client)
+INFERENCE_ENDPOINT = "openai-inference"
 
 @app.route("/", methods=["GET"])
 def home():
     return "<h1>Welcome to sunnah.com search api.</h1>"
 
+def create_inference_endpoint():
+    try:
+        if_client.delete(task_type="text_embedding", inference_id=INFERENCE_ENDPOINT, force=True)
+    except Exception as e:
+        print(e)
+        
+    if_client.put(task_type="text_embedding", inference_id=INFERENCE_ENDPOINT, body={
+    "service": "openai",
+    "service_settings": {
+        "api_key": os.environ.get("OPENAI_KEY"),
+        "model_id": "text-embedding-3-small",
+        "dimensions": 128
+    }
+    })
 
 def create_and_update_index(index_name, documents, fields_to_not_index):
     settings = {
@@ -95,6 +110,10 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
                 "fields": {
                     "trigram": {"type": "text", "analyzer": "trigram"},
                 },
+            },
+            "hadithTextSemantic": {
+                "type": "semantic_text",
+                "inference_id": INFERENCE_ENDPOINT
             }
         }
         | {"arabicText": {"type": "text", "analyzer": "custom_arabic"}}
@@ -102,7 +121,12 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
     if es_client.indices.exists(index=index_name):
         es_client.indices.delete(index=index_name)
     es_client.indices.create(index=index_name, mappings=mappings, settings=settings)
-    successCount, errors = helpers.bulk(es_client, documents, index=index_name)
+    successCount, errors = 0, []
+    try:
+        successCount, errors = helpers.bulk(es_client, documents, index=index_name, request_timeout=120)
+    except helpers.BulkIndexError as e:
+        print(e.errors)
+        print("LEN: ", len(e.errors))
     return successCount, errors
 
 def get_suggest_query(suggest_field):
@@ -130,6 +154,8 @@ def index():
     start = time.time()
     if request.args.get("password") != os.environ.get("INDEXING_PASSWORD"):
         return "Must provide valid password to index", 401
+
+    create_inference_endpoint()
 
     connection = pymysql.connect(
         host=os.environ.get("MYSQL_HOST"),
@@ -163,13 +189,13 @@ def index():
 
     # Add arabic text and hadithNumber to english hadith
     for englishHadith in englishHadiths:
+        englishHadith["hadithTextSemantic"] = englishHadith["hadithText"]
         if englishHadith["urn"] not in matchingArabicHadiths:
            continue
         matchingArabic = matchingArabicHadiths[englishHadith["urn"]]
         englishHadith["arabicText"] = matchingArabic["arabicText"]
         englishHadith["arabicGrade"] = matchingArabic["grade"]
         englishHadith["hadithNumber"] = matchingArabic["hadithNumber"]
-        
     indexingSuccessCount, indexingErrors = create_and_update_index(
         "english", englishHadiths + arabicOnlyHadiths, ["urn", "matchingArabicURN", "lang"]
     )
@@ -191,13 +217,28 @@ def index():
 def search(language):
     query = request.args.get("q")
     # TODO: 'query_string' is strict and does not allow syntax erorrs. Compare to current behavior
-    query_dsl = {
+    lexical_query = {
         "query_string": {
             "query": query,
             "type": "cross_fields",
-            "fields": ["hadithNumber^2", "hadithText", "arabicText", "collection^2"],
+            "fields": ["hadithNumber^2", "hadithText", "arabicText", "collection^10"],
+            "boost": 1
         }
     }
+    semantic_query = {
+        "semantic": {
+            "field": "hadithTextSemantic",
+            "query": query,
+            "boost" : 50
+        }
+    }
+    query_dsl = {
+     "bool": {
+      "should": [
+         lexical_query, semantic_query
+      ]
+        }
+      }
     return jsonify(
         es_client.search(
             index=language,
@@ -214,6 +255,8 @@ def search(language):
                      "phrase": get_suggest_query("arabicText"),
                  },
             },
+            timeout="120s",
+            request_timeout=130
         ).body
     )
 
