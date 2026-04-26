@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 import math
 import json
 
-from elasticsearch import Elasticsearch, helpers
+from elasticsearch import Elasticsearch, helpers, BadRequestError
 
 load_dotenv(".env.local")
 
@@ -203,45 +203,45 @@ def search(language):
     query = request.args.get("q")
     filter = get_filter_from_args(request.args)
 
-    # TODO: Query string has a strict syntax and can cause failures when character like ":" appear in a search query. 
+    fields = ["hadithNumber^2", "hadithText", "arabicText", "collection^2"]
+
+    # TODO: Query string has a strict syntax and can cause failures when character like ":" appear in a search query.
     # It's not recomended for search. But it's what allows us to do "AND collection:bukhari" or "AND hadithNumber:123" in the search bar
     # Could be better to expose all those fields as filters instead and move away from query_string
-    query_string = {
-        "query_string": {
-            "query": query,
-            "type": "cross_fields",
-            "fields": ["hadithNumber^2", "hadithText", "arabicText", "collection^2"],
-        }               
-    }
-    
-    # Complete query with must (for search) and filter (for exact matches, collection, grade, etc)
-    bool_query = {
-        "bool": {
-            "filter": filter,
-            "must": [
-                query_string
-            ],
+    def build_bool_query(query_type):
+        inner = {"query": query, "fields": fields}
+        if query_type == "query_string":
+            inner["type"] = "cross_fields"
+        return {
+            "bool": {
+                "filter": filter,
+                "must": [{query_type: inner}],
+            }
         }
-    }
-    
-    return jsonify(
-        es_client.search(
-            index=language,
-            query=bool_query,
-            from_=request.args.get("from", 0),
-            size=request.args.get("size", 10),
-            highlight={"number_of_fragments": 0, "fields": {"*": {}}},
-            suggest= {
-                "text": query,
-                "english": {
-                     "phrase": get_suggest_query("hadithText.trigram"),
-                 },
-                "arabic": {
-                     "phrase": get_suggest_query("arabicText"),
-                 },
+
+    search_kwargs = {
+        "index": language,
+        "from_": request.args.get("from", 0),
+        "size": request.args.get("size", 10),
+        "highlight": {"number_of_fragments": 0, "fields": {"*": {}}},
+        "suggest": {
+            "text": query,
+            "english": {
+                "phrase": get_suggest_query("hadithText.trigram"),
             },
-        ).body
-    )
+            "arabic": {
+                "phrase": get_suggest_query("arabicText"),
+            },
+        },
+    }
+
+    try:
+        result = es_client.search(query=build_bool_query("query_string"), **search_kwargs)
+    except BadRequestError:
+        # query_string syntax is strict; retry once with simple_query_string, which tolerates malformed input
+        result = es_client.search(query=build_bool_query("simple_query_string"), **search_kwargs)
+
+    return jsonify(result.body)
 
 
 if __name__ == "__main__":
