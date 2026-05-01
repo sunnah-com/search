@@ -69,11 +69,15 @@ class ShortcodeStripTests(unittest.TestCase):
         self.assertIn("foo", out)
         self.assertIn("bar", out)
 
-    def test_known_false_positive_single_word_in_brackets(self):
-        # Documented trade-off: a bare single-word bracket is structurally
-        # indistinguishable from a [tag] shortcode, so it gets stripped.
-        # If this ever needs to change, update SHORTCODE_PATTERN.
-        self.assertEqual(strip("[Al-Bukhari]"), " ")
+    def test_preserves_capitalized_single_word_in_brackets(self):
+        # Tag names are lowercase in source data, so capitalized bracketed
+        # references are content, not shortcodes.
+        self.assertEqual(strip("[Al-Bukhari]"), "[Al-Bukhari]")
+
+    def test_strips_lowercase_single_word_in_brackets(self):
+        # A bare lowercase single-word bracket is structurally identical to a
+        # [tag] shortcode, so it is still stripped.
+        self.assertEqual(strip("[bukhari]"), " ")
 
 
 if __name__ == "__main__":

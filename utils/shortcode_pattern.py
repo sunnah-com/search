@@ -9,10 +9,11 @@ exercise from unit tests.
 
 # Matches shortcode-shaped tags so they can be stripped before tokenization:
 #   [tag], [/tag], [tag attr="v" attr2='v'], [tag attr=bare], [tag/]
-# Designed NOT to match multi-word bracketed asides (e.g. "[bleeding (from the
-# womb) ...]") because those don't fit the tag-then-attrs shape.
+# Tag names are always lowercase in the source data, so capitalized bracketed
+# text like "[Al-Bukhari]" is preserved as content. Also designed NOT to match
+# multi-word bracketed asides (e.g. "[bleeding (from the womb) ...]").
 SHORTCODE_PATTERN = (
-    r"""\[/?[a-zA-Z][a-zA-Z0-9_-]*"""
+    r"""\[/?[a-z][a-z0-9_-]*"""
     r"""(?:\s+[a-zA-Z_:][a-zA-Z0-9_:.-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s\]]+))*"""
     r"""\s*/?\]"""
 )
