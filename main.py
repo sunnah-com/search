@@ -8,6 +8,8 @@ import json
 
 from elasticsearch import Elasticsearch, helpers, BadRequestError
 
+from utils.shortcode_pattern import SHORTCODE_PATTERN
+
 load_dotenv(".env.local")
 
 
@@ -31,13 +33,13 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
                     "trigram": {
                         "type": "custom",
                         "tokenizer": "standard",
-                        "char_filter": ["html_strip"],
+                        "char_filter": ["html_strip", "shortcode_strip"],
                         "filter": ["lowercase", "stop", "shingle"],
                     },
                     "synonym": {
                         "type": "custom",
                         "tokenizer": "standard",
-                        "char_filter": ["html_strip"],
+                        "char_filter": ["html_strip", "shortcode_strip"],
                         "filter": [
                             "lowercase",
                             "stop",
@@ -47,7 +49,7 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
                     },
                     "custom_arabic": {
                         "tokenizer":  "standard",
-                        "char_filter": ["html_strip"],
+                        "char_filter": ["html_strip", "shortcode_strip"],
                         "filter": [
                             "lowercase",
                             "decimal_digit",
@@ -55,6 +57,13 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
                             "arabic_stemmer",
                             "shingle"
                         ]
+                    }
+                },
+                "char_filter": {
+                    "shortcode_strip": {
+                        "type": "pattern_replace",
+                        "pattern": SHORTCODE_PATTERN,
+                        "replacement": " ",
                     }
                 },
                 "filter": {
