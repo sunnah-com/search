@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 import math
 import json
 
-from elasticsearch import Elasticsearch, helpers, BadRequestError
+from elasticsearch import Elasticsearch, helpers, BadRequestError, NotFoundError
 
 from utils.shortcode_pattern import SHORTCODE_PATTERN
 
@@ -17,6 +17,8 @@ app = Flask(__name__)
 es_auth = ("elastic", os.environ.get("ELASTIC_PASSWORD"))
 es_base_url = f"http://elasticsearch:{os.environ.get('ES_PORT')}"
 es_client = Elasticsearch(es_base_url, http_auth=es_auth)
+
+INDEX_NAME = "english"
 
 
 @app.route("/", methods=["GET"])
@@ -180,7 +182,7 @@ def index():
         englishHadith["hadithNumber"] = matchingArabic["hadithNumber"]
         
     indexingSuccessCount, indexingErrors = create_and_update_index(
-        "english", englishHadiths + arabicOnlyHadiths, ["urn", "matchingArabicURN", "lang"]
+        INDEX_NAME, englishHadiths + arabicOnlyHadiths, ["urn", "matchingArabicURN", "lang"]
     )
 
     connection.close()
@@ -193,6 +195,28 @@ def index():
             "count": len(arabicOnlyHadiths),
         },
         "timeInSeconds": time.time() - start
+    }
+
+
+@app.route("/index/status", methods=["GET"])
+def index_status():
+    try:
+        result = es_client.search(
+            index=INDEX_NAME,
+            size=0,
+            track_total_hits=True,
+            aggs={"english": {"filter": {"exists": {"field": "hadithText"}}}},
+        )
+    except NotFoundError:
+        return {"indexed": False}
+
+    total = result["hits"]["total"]["value"]
+    english = result["aggregations"]["english"]["doc_count"]
+    return {
+        "indexed": True,
+        "total_count": total,
+        "english_count": english,
+        "arabic_only_count": total - english,
     }
 
 
