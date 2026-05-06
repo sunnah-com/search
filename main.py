@@ -20,6 +20,23 @@ es_client = Elasticsearch(es_base_url, http_auth=es_auth)
 
 INDEX_NAME = "english"
 
+# Tiebreaker boosts added on top of the text-similarity score so canonical
+# collections rise when relevance is otherwise comparable. Sized to swing
+# rankings when BM25 scores are within a few points (e.g. the same hadith
+# narrated across collections), but still let a clearly stronger text match
+# from a less canonical collection win.
+COLLECTION_BOOSTS = [
+    ("bukhari", 5.0),
+    ("muslim", 5.0),
+    ("nasai", 3.5),
+    ("abudawud", 3.0),
+    ("tirmidhi", 2.5),
+    ("ibnmajah", 2.0),
+    ("malik", 1.5),
+    ("ahmad", 1.0),
+    ("darimi", 0.5),
+]
+
 
 @app.route("/", methods=["GET"])
 def home():
@@ -241,14 +258,24 @@ def search(language):
     # TODO: Query string has a strict syntax and can cause failures when character like ":" appear in a search query.
     # It's not recomended for search. But it's what allows us to do "AND collection:bukhari" or "AND hadithNumber:123" in the search bar
     # Could be better to expose all those fields as filters instead and move away from query_string
-    def build_bool_query(query_type):
+    def build_query(query_type):
         inner = {"query": query, "fields": fields}
         if query_type == "query_string":
             inner["type"] = "cross_fields"
         return {
-            "bool": {
-                "filter": filter,
-                "must": [{query_type: inner}],
+            "function_score": {
+                "query": {
+                    "bool": {
+                        "filter": filter,
+                        "must": [{query_type: inner}],
+                    }
+                },
+                "functions": [
+                    {"filter": {"term": {"collection": name}}, "weight": weight}
+                    for name, weight in COLLECTION_BOOSTS
+                ],
+                "score_mode": "sum",
+                "boost_mode": "sum",
             }
         }
 
@@ -269,10 +296,10 @@ def search(language):
     }
 
     try:
-        result = es_client.search(query=build_bool_query("query_string"), **search_kwargs)
+        result = es_client.search(query=build_query("query_string"), **search_kwargs)
     except BadRequestError:
         # query_string syntax is strict; retry once with simple_query_string, which tolerates malformed input
-        result = es_client.search(query=build_bool_query("simple_query_string"), **search_kwargs)
+        result = es_client.search(query=build_query("simple_query_string"), **search_kwargs)
 
     return jsonify(result.body)
 
