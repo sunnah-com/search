@@ -27,14 +27,17 @@ INDEX_NAME = "english"
 # from a less canonical collection win.
 COLLECTION_BOOSTS = [
     ("bukhari", 5.0),
-    ("muslim", 5.0),
+    ("muslim", 4.8),
     ("nasai", 3.5),
     ("abudawud", 3.0),
     ("tirmidhi", 2.5),
     ("ibnmajah", 2.0),
-    ("malik", 1.5),
-    ("ahmad", 1.0),
-    ("darimi", 0.5),
+    ("malik", 2.5),
+    ("ahmad", 2.5),
+    ("darimi", 2.0),
+    ("mishkat", 3.5),
+    ("nawawi40", 3.7),
+    ("riyadussalihin", 3.0),
 ]
 
 
