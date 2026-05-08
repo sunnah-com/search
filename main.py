@@ -35,9 +35,9 @@ COLLECTION_BOOSTS = [
     ("malik", 2.5),
     ("ahmad", 2.5),
     ("darimi", 2.0),
-    ("mishkat", 3.5),
-    ("nawawi40", 3.7),
-    ("riyadussalihin", 3.0),
+    ("mishkat", 2.5),
+    ("nawawi40", 3.3),
+    ("riyadussalihin", 2.5),
 ]
 
 
