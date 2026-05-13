@@ -3,6 +3,7 @@ version: '3'
 services:
   db:
     image: mysql:5.7.22
+    platform: linux/amd64
     command: --default-authentication-plugin=mysql_native_password
     volumes:
       - ./db:/docker-entrypoint-initdb.d/:ro
@@ -31,7 +32,7 @@ services:
       - cluster.routing.allocation.disk.threshold_enabled=false
     volumes:
       - ./config/synonyms.txt:/usr/share/elasticsearch/config/synonyms.txt
-      - ./es-logs:/usr/share/elasticsearch/logs
+      - es-logs:/usr/share/elasticsearch/logs
     env_file:
       - .env
   es-exporter:
@@ -56,7 +57,7 @@ services:
       - /etc/alloy/config.alloy
     volumes:
       - ./config/alloy/config.alloy:/etc/alloy/config.alloy:ro
-      - ./es-logs:/es-logs:ro
+      - es-logs:/es-logs:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - GC_LOKI_URL=${GC_LOKI_URL}
@@ -66,4 +67,7 @@ services:
       - GC_PROM_USER=${GC_PROM_USER}
       - GC_PROM_PASSWORD=${GC_PROM_PASSWORD}
       - DEPLOY_ENV=${DEPLOY_ENV:-local}
+
+volumes:
+  es-logs:
 
