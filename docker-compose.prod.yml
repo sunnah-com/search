@@ -29,7 +29,7 @@ services:
       - "ES_JAVA_OPTS=-Xms600m -Xmx1g"
     volumes:
       - ./config/synonyms.txt:/usr/share/elasticsearch/config/synonyms.txt
-      - ./data:/usr/share/elasticsearch/data
+      - es-data:/usr/share/elasticsearch/data
       - es-logs:/usr/share/elasticsearch/logs
     env_file:
       - .env
@@ -78,4 +78,5 @@ networks:
 
 volumes:
   es-logs:
+  es-data:
 
