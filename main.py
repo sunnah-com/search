@@ -1,5 +1,8 @@
+import logging
+import sys
 import time
-from flask import Flask, request, jsonify
+import uuid
+from flask import Flask, request, jsonify, g
 import pymysql
 import os
 from dotenv import load_dotenv
@@ -7,13 +10,50 @@ import math
 import json
 
 from elasticsearch import Elasticsearch, helpers, BadRequestError, NotFoundError
+from pythonjsonlogger import jsonlogger
 
 from utils.shortcode_pattern import SHORTCODE_PATTERN
 
 load_dotenv(".env.local")
 
 
+_log_handler = logging.StreamHandler(sys.stdout)
+_log_handler.setFormatter(
+    jsonlogger.JsonFormatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+)
+access_log = logging.getLogger("search.access")
+access_log.setLevel(logging.INFO)
+access_log.addHandler(_log_handler)
+access_log.propagate = False
+
+
 app = Flask(__name__)
+
+
+@app.before_request
+def _record_request_start():
+    g.request_start = time.perf_counter()
+    g.request_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex
+
+
+@app.after_request
+def _emit_access_log(response):
+    duration_ms = (time.perf_counter() - g.request_start) * 1000
+    access_log.info(
+        "request",
+        extra={
+            "request_id": g.request_id,
+            "method": request.method,
+            "path": request.path,
+            "status": response.status_code,
+            "duration_ms": round(duration_ms, 2),
+            "remote_addr": request.headers.get("X-Forwarded-For", request.remote_addr),
+            "query": request.args.to_dict(flat=False),
+            "user_agent": request.headers.get("User-Agent"),
+        },
+    )
+    response.headers["X-Request-Id"] = g.request_id
+    return response
 es_auth = ("elastic", os.environ.get("ELASTIC_PASSWORD"))
 es_base_url = f"http://elasticsearch:{os.environ.get('ES_PORT')}"
 es_client = Elasticsearch(es_base_url, http_auth=es_auth)
@@ -50,6 +90,9 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
     settings = {
         "index": {
             "number_of_shards": 1,
+            "search.slowlog.threshold.query.warn":  "1s",
+            "search.slowlog.threshold.query.info":  "500ms",
+            "search.slowlog.threshold.fetch.warn":  "500ms",
             "analysis": {
                 "analyzer": {
                     "trigram": {

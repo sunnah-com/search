@@ -31,6 +31,39 @@ services:
       - cluster.routing.allocation.disk.threshold_enabled=false
     volumes:
       - ./config/synonyms.txt:/usr/share/elasticsearch/config/synonyms.txt
+      - ./es-logs:/usr/share/elasticsearch/logs
     env_file:
       - .env
-     
+  es-exporter:
+    image: quay.io/prometheuscommunity/elasticsearch-exporter:v1.7.0
+    restart: unless-stopped
+    command:
+      - '--es.uri=http://elasticsearch:9200'
+      - '--es.all'
+      - '--es.indices'
+    environment:
+      - ES_USERNAME=elastic
+      - ES_PASSWORD=${ELASTIC_PASSWORD}
+    mem_limit: 64m
+    depends_on:
+      - elasticsearch
+  alloy:
+    image: grafana/alloy:v1.4.2
+    restart: unless-stopped
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./config/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - ./es-logs:/es-logs:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - GC_LOKI_URL=${GC_LOKI_URL}
+      - GC_LOKI_USER=${GC_LOKI_USER}
+      - GC_LOKI_PASSWORD=${GC_LOKI_PASSWORD}
+      - GC_PROM_URL=${GC_PROM_URL}
+      - GC_PROM_USER=${GC_PROM_USER}
+      - GC_PROM_PASSWORD=${GC_PROM_PASSWORD}
+      - DEPLOY_ENV=${DEPLOY_ENV:-local}
+

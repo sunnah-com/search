@@ -1,0 +1,142 @@
+// Grafana Alloy config: tails Docker container logs and ships them to
+// Grafana Cloud Loki. Metrics (request rate, error rate, latency) are
+// derived from the structured JSON log lines emitted by the Flask app.
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  // Use the docker-compose service name as the `service` label.
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  // Container name (strip leading slash) as a secondary label.
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  // Drop containers without a compose service label (e.g. alloy itself
+  // when run outside compose, or stray containers on the host).
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    regex         = ""
+    action        = "drop"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  forward_to = [loki.process.add_env.receiver]
+  labels     = {
+    env = coalesce(sys.env("DEPLOY_ENV"), "prod"),
+  }
+}
+
+// Parse the JSON log line so common fields become structured metadata
+// that LogQL can `unwrap` for metric queries (rate, p95 latency, etc).
+loki.process "add_env" {
+  forward_to = [loki.write.grafana_cloud.receiver]
+
+  stage.json {
+    expressions = {
+      level       = "levelname",
+      status      = "status",
+      duration_ms = "duration_ms",
+      path        = "path",
+      method      = "method",
+    }
+  }
+
+  // Promote a small, bounded set of fields to labels. Do NOT promote
+  // path/duration/request_id — those are unbounded and would blow up
+  // Loki cardinality. Keep them as structured metadata for unwrap.
+  stage.labels {
+    values = {
+      level  = "",
+      method = "",
+      status = "",
+    }
+  }
+}
+
+loki.write "grafana_cloud" {
+  endpoint {
+    url = sys.env("GC_LOKI_URL")
+    basic_auth {
+      username = sys.env("GC_LOKI_USER")
+      password = sys.env("GC_LOKI_PASSWORD")
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Elasticsearch slow-query log: tail the JSON file ES writes when a search
+// exceeds the configured threshold. Requires the `elasticsearch` container
+// to mount /usr/share/elasticsearch/logs and slowlog thresholds to be set
+// per-index (the app sets these when (re)creating the index).
+// ---------------------------------------------------------------------------
+
+local.file_match "es_slowlog" {
+  path_targets = [{
+    __path__  = "/es-logs/*_index_search_slowlog.json",
+    service   = "elasticsearch",
+    log_type  = "slowlog",
+    env       = coalesce(sys.env("DEPLOY_ENV"), "prod"),
+  }]
+}
+
+loki.source.file "es_slowlog" {
+  targets    = local.file_match.es_slowlog.targets
+  forward_to = [loki.process.es_slowlog.receiver]
+}
+
+loki.process "es_slowlog" {
+  forward_to = [loki.write.grafana_cloud.receiver]
+
+  stage.json {
+    expressions = {
+      level       = "level",
+      took_millis = "took_millis",
+      index       = "\"elasticsearch.index.name\"",
+    }
+  }
+
+  stage.labels {
+    values = {
+      level = "",
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Elasticsearch metrics: scrape the elasticsearch-exporter sidecar and
+// remote-write to Grafana Cloud Mimir/Prometheus.
+// ---------------------------------------------------------------------------
+
+prometheus.scrape "es_exporter" {
+  targets = [{
+    __address__ = "es-exporter:9114",
+    service     = "elasticsearch",
+    env         = coalesce(sys.env("DEPLOY_ENV"), "prod"),
+  }]
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+  scrape_interval = "30s"
+}
+
+prometheus.remote_write "grafana_cloud" {
+  endpoint {
+    url = sys.env("GC_PROM_URL")
+    basic_auth {
+      username = sys.env("GC_PROM_USER")
+      password = sys.env("GC_PROM_PASSWORD")
+    }
+  }
+}
