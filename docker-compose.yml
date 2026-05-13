@@ -21,6 +21,8 @@ services:
       - "5000:5000"
     env_file:
       - .env
+    extra_hosts:
+      - "elasticsearch:172.31.250.10"
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:${ES_STACK_VERSION}
     container_name: elasticsearch
@@ -35,6 +37,9 @@ services:
       - es-logs:/usr/share/elasticsearch/logs
     env_file:
       - .env
+    networks:
+      default:
+        ipv4_address: 172.31.250.10
   es-exporter:
     image: quay.io/prometheuscommunity/elasticsearch-exporter:v1.7.0
     restart: unless-stopped
@@ -67,6 +72,13 @@ services:
       - GC_PROM_USER=${GC_PROM_USER}
       - GC_PROM_PASSWORD=${GC_PROM_PASSWORD}
       - DEPLOY_ENV=${DEPLOY_ENV:-local}
+
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
 
 volumes:
   es-logs:

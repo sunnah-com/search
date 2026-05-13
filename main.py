@@ -3,6 +3,7 @@ import sys
 import time
 import uuid
 from flask import Flask, request, jsonify, g
+from werkzeug.exceptions import HTTPException
 import pymysql
 import os
 from dotenv import load_dotenv
@@ -56,7 +57,13 @@ def _emit_access_log(response):
     return response
 es_auth = ("elastic", os.environ.get("ELASTIC_PASSWORD"))
 es_base_url = f"http://elasticsearch:{os.environ.get('ES_PORT')}"
-es_client = Elasticsearch(es_base_url, http_auth=es_auth)
+es_client = Elasticsearch(
+    es_base_url,
+    http_auth=es_auth,
+    max_retries=3,
+    retry_on_timeout=True,
+    request_timeout=10,
+)
 
 INDEX_NAME = "english"
 
@@ -79,6 +86,19 @@ COLLECTION_BOOSTS = [
     ("nawawi40", 3.3),
     ("riyadussalihin", 2.5),
 ]
+
+@app.errorhandler(Exception)
+def _handle_unexpected(exc):
+    if isinstance(exc, HTTPException):
+        return exc
+    access_log.exception(
+        "unhandled_exception",
+        extra={
+            "request_id": getattr(g, "request_id", None),
+            "exception": type(exc).__name__,
+        },
+    )
+    return jsonify({"error": "internal server error"}), 500
 
 
 @app.route("/", methods=["GET"])
@@ -342,10 +362,21 @@ def search(language):
     }
 
     try:
-        result = es_client.search(query=build_query("query_string"), **search_kwargs)
-    except BadRequestError:
-        # query_string syntax is strict; retry once with simple_query_string, which tolerates malformed input
-        result = es_client.search(query=build_query("simple_query_string"), **search_kwargs)
+        try:
+            result = es_client.search(query=build_query("query_string"), **search_kwargs)
+        except BadRequestError:
+            # query_string syntax is strict; retry once with simple_query_string, which tolerates malformed input
+            result = es_client.search(query=build_query("simple_query_string"), **search_kwargs)
+    except BadRequestError as e:
+        # Don't leak ES internals (field paths, index names) to client.
+        access_log.warning(
+            "malformed_query",
+            extra={
+                "request_id": getattr(g, "request_id", None),
+                "detail": str(e),
+            },
+        )
+        return jsonify({"error": "malformed query"}), 400
 
     return jsonify(result.body)
 
