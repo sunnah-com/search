@@ -21,12 +21,14 @@ services:
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:${ES_STACK_VERSION}
     container_name: elasticsearch
+    restart: unless-stopped
+    mem_limit: 2g
     environment:
       - node.name=elasticsearch
       - discovery.type=single-node
       - xpack.security.enabled=true
       - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
-      - "ES_JAVA_OPTS=-Xms600m -Xmx1g"
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
     volumes:
       - ./config/synonyms.txt:/usr/share/elasticsearch/config/synonyms.txt
       - es-data:/usr/share/elasticsearch/data
