@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import sys
 import time
@@ -69,6 +70,9 @@ INDEX_NAME = "english"
 
 SEMANTIC_ENABLED = os.environ.get("SEMANTIC_SEARCH_ENABLED", "").lower() in ("1", "true", "yes")
 SEMANTIC_FIELD = "hadithTextSemantic"
+# Per-doc content hash stored alongside each document. An incremental reindex
+# diffs incoming docs against this to skip re-embedding unchanged hadiths.
+CONTENT_HASH_FIELD = "contentHash"
 INFERENCE_ENDPOINT = "openai-text-embedding"
 # RRF constants. k=60 is the value from the original Cormack et al. paper and
 # the ES default. RRF_WINDOW is the depth fetched from each retriever before
@@ -123,14 +127,18 @@ def home():
 
 def create_inference_endpoint():
     """Create the OpenAI text-embedding inference endpoint used by the
-    semantic_text field. Deletes any existing endpoint with the same id so
-    re-indexing picks up dimension/model changes."""
+    semantic_text field, only if it doesn't already exist.
+
+    Kept stable across re-indexes: the alias swap builds a new index while the
+    old one keeps serving traffic, and both reference this endpoint by id —
+    force-deleting it mid-reindex would break the live index's semantic field.
+    To change the model or dimensions, delete the endpoint manually so the
+    next reindex recreates it."""
     try:
-        es_client.inference.delete(
-            task_type="text_embedding",
-            inference_id=INFERENCE_ENDPOINT,
-            force=True,
+        es_client.inference.get(
+            task_type="text_embedding", inference_id=INFERENCE_ENDPOINT
         )
+        return
     except NotFoundError:
         pass
     es_client.options(request_timeout=60).inference.put(
@@ -150,7 +158,46 @@ def create_inference_endpoint():
     )
 
 
-def create_and_update_index(index_name, documents, fields_to_not_index):
+def _content_hash(doc):
+    """Stable hash of a document's content. Covers every field except the id,
+    the hash itself, and the semantic field (a verbatim copy of hadithText, so
+    already captured). Any source change flips the hash and the doc is
+    re-indexed — which, for the semantic field, means re-embedded."""
+    payload = {
+        k: v
+        for k, v in doc.items()
+        if k not in ("_id", CONTENT_HASH_FIELD, SEMANTIC_FIELD)
+    }
+    encoded = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _prepare_documents(documents):
+    """Assign each doc a deterministic _id and a content hash, in place. The
+    _id namespaces urn by language because the English and Arabic URN spaces
+    overlap; it lets a reindex match an incoming doc to its indexed copy."""
+    for doc in documents:
+        doc["_id"] = f"{doc['lang']}:{doc['urn']}"
+        doc[CONTENT_HASH_FIELD] = _content_hash(doc)
+    return documents
+
+
+def _index_supports_incremental():
+    """True if the live index was built by the current indexer — detected by
+    the content-hash field in its mapping. An older index lacks it (and has
+    non-deterministic ids), so it must be rebuilt before incremental diffing
+    can work; until then a reindex would churn the whole corpus."""
+    try:
+        mapping = es_client.indices.get_mapping(index=INDEX_NAME)
+    except NotFoundError:
+        return False
+    return all(
+        CONTENT_HASH_FIELD in index_def.get("mappings", {}).get("properties", {})
+        for index_def in mapping.values()
+    ) and bool(mapping)
+
+
+def create_and_update_index(documents, fields_to_not_index):
     settings = {
         "index": {
             "number_of_shards": 1,
@@ -242,21 +289,115 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
             "type": "semantic_text",
             "inference_id": INFERENCE_ENDPOINT,
         }
-    if es_client.indices.exists(index=index_name):
-        es_client.indices.delete(index=index_name)
-    es_client.indices.create(index=index_name, mappings=mappings, settings=settings)
+    mappings["properties"][CONTENT_HASH_FIELD] = {"type": "keyword", "index": False}
+    # Zero-downtime reindex: build into a fresh concrete index, then atomically
+    # repoint the INDEX_NAME alias at it. Searches keep hitting the old index
+    # until the swap, so there's no NotFoundError window. The previous
+    # delete-then-recreate caused ~2-3 min of downtime.
+    new_index = f"{INDEX_NAME}-{int(time.time())}"
+    es_client.indices.create(index=new_index, mappings=mappings, settings=settings)
+
+    _prepare_documents(documents)
+
     # When semantic_text is in the mapping each doc triggers an embedding API
-    # call during indexing, so the bulk request needs a longer timeout.
+    # call during indexing, so the bulk request needs a longer timeout. Indexing
+    # stays single-stream: OpenAI's tokens-per-minute quota is the ceiling for
+    # the embedding calls, so fanning out just trips 429s without going faster.
     bulk_timeout = 300 if SEMANTIC_ENABLED else 60
     successCount, errors = helpers.bulk(
         es_client,
         documents,
-        index=index_name,
+        index=new_index,
         request_timeout=bulk_timeout,
         raise_on_error=False,
         raise_on_exception=False,
     )
+
+    # Don't swap an empty/failed build over a working index.
+    if successCount == 0:
+        es_client.indices.delete(index=new_index, ignore_unavailable=True)
+        return successCount, errors
+
+    # Find whatever currently serves the alias so we can retire it after the swap.
+    old_indices = []
+    if es_client.indices.exists_alias(name=INDEX_NAME):
+        old_indices = list(es_client.indices.get_alias(name=INDEX_NAME).keys())
+    elif es_client.indices.exists(index=INDEX_NAME):
+        # Legacy concrete index occupying the alias name (pre-alias deploys).
+        # It must go before an alias of the same name can exist — one-time,
+        # brief gap on the first reindex after this change ships.
+        es_client.indices.delete(index=INDEX_NAME)
+
+    # Atomic alias swap: add new + remove old in a single cluster action.
+    actions = [{"add": {"index": new_index, "alias": INDEX_NAME}}]
+    for old in old_indices:
+        actions.append({"remove": {"index": old, "alias": INDEX_NAME}})
+    es_client.indices.update_aliases(actions=actions)
+
+    for old in old_indices:
+        es_client.indices.delete(index=old, ignore_unavailable=True)
+
     return successCount, errors
+
+
+def incremental_update_index(documents):
+    """Reindex by diffing against the live index instead of rebuilding it.
+
+    Each incoming doc carries a content hash; we fetch the stored hashes from
+    the live index and only touch what changed:
+      - new / changed docs are re-indexed (and, for the semantic field,
+        re-embedded — the only OpenAI calls made)
+      - docs no longer in the source are deleted
+      - unchanged docs are left untouched
+
+    Hadith text is near-static, so a typical run embeds a handful of docs
+    rather than the whole corpus — sidestepping the OpenAI rate limit a full
+    rebuild hits. Updates apply in place and atomically per doc, so there's no
+    downtime and no alias swap. A mapping/analysis change still needs a full
+    rebuild (use ?rebuild=true)."""
+    _prepare_documents(documents)
+    incoming = {doc["_id"]: doc for doc in documents}
+
+    # Pull just {_id: contentHash} for every indexed doc — no _source bodies,
+    # so this stays cheap even for the full corpus.
+    existing_hashes = {}
+    for hit in helpers.scan(
+        es_client,
+        index=INDEX_NAME,
+        query={"_source": [CONTENT_HASH_FIELD]},
+        size=2000,
+    ):
+        existing_hashes[hit["_id"]] = hit["_source"].get(CONTENT_HASH_FIELD)
+
+    to_index = [
+        doc
+        for doc_id, doc in incoming.items()
+        if existing_hashes.get(doc_id) != doc[CONTENT_HASH_FIELD]
+    ]
+    to_delete = [doc_id for doc_id in existing_hashes if doc_id not in incoming]
+
+    actions = list(to_index) + [
+        {"_op_type": "delete", "_id": doc_id} for doc_id in to_delete
+    ]
+    success_count, errors = 0, []
+    if actions:
+        bulk_timeout = 300 if SEMANTIC_ENABLED else 60
+        success_count, errors = helpers.bulk(
+            es_client,
+            actions,
+            index=INDEX_NAME,
+            request_timeout=bulk_timeout,
+            raise_on_error=False,
+            raise_on_exception=False,
+        )
+    return {
+        "indexed": len(to_index),
+        "deleted": len(to_delete),
+        "unchanged": len(incoming) - len(to_index),
+        "success_count": success_count,
+        "errors": errors,
+    }
+
 
 def get_suggest_query(suggest_field):
     return {
@@ -357,21 +498,36 @@ def index():
         englishHadith["arabicGrade"] = matchingArabic["grade"]
         englishHadith["hadithNumber"] = matchingArabic["hadithNumber"]
         
-    indexingSuccessCount, indexingErrors = create_and_update_index(
-        INDEX_NAME, englishHadiths + arabicOnlyHadiths, ["urn", "matchingArabicURN", "lang"]
-    )
-
     connection.close()
-    return {
-        "all_hadith_index_results": {
-            "success_count": indexingSuccessCount,
-            "failed": json.dumps(indexingErrors),
-        },
-       "arabic_only": {
-            "count": len(arabicOnlyHadiths),
-        },
-        "timeInSeconds": time.time() - start
-    }
+    documents = englishHadiths + arabicOnlyHadiths
+
+    # Full rebuild when explicitly asked (?rebuild=true — needed after a
+    # mapping/analysis change) or when there's no current-format index to diff
+    # against. Otherwise diff against the live index and touch only what changed.
+    rebuild = request.args.get("rebuild", "").lower() in ("1", "true", "yes")
+    if rebuild or not _index_supports_incremental():
+        successCount, errors = create_and_update_index(
+            documents, ["urn", "matchingArabicURN", "lang"]
+        )
+        result = {
+            "mode": "rebuild",
+            "success_count": successCount,
+            "failed": json.dumps(errors),
+        }
+    else:
+        stats = incremental_update_index(documents)
+        result = {
+            "mode": "incremental",
+            "indexed": stats["indexed"],
+            "deleted": stats["deleted"],
+            "unchanged": stats["unchanged"],
+            "success_count": stats["success_count"],
+            "failed": json.dumps(stats["errors"]),
+        }
+
+    result["arabic_only"] = {"count": len(arabicOnlyHadiths)}
+    result["timeInSeconds"] = time.time() - start
+    return result
 
 
 @app.route("/index/status", methods=["GET"])
