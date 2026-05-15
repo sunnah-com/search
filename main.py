@@ -76,6 +76,12 @@ INFERENCE_ENDPOINT = "openai-text-embedding"
 RRF_K = 60
 RRF_WINDOW = 100
 
+# Search modes. SEMANTIC_MODES are the ones needing the inference endpoint —
+# kept as one tuple so the "needs the semantic backend" rule has a single
+# source of truth across mode resolution and request dispatch.
+SEARCH_MODES = ("lexical", "hybrid", "semantic")
+SEMANTIC_MODES = ("hybrid", "semantic")
+
 # Tiebreaker boosts added on top of the text-similarity score so canonical
 # collections rise when relevance is otherwise comparable. Sized to swing
 # rankings when BM25 scores are within a few points (e.g. the same hadith
@@ -272,6 +278,35 @@ def get_suggest_query(suggest_field):
         },
     }
 
+
+def get_suggest_block(query):
+    """Phrase-suggester ("did you mean") block covering English + Arabic text."""
+    return {
+        "text": query,
+        "english": {"phrase": get_suggest_query("hadithText.trigram")},
+        "arabic": {"phrase": get_suggest_query("arabicText")},
+    }
+
+
+def build_semantic_query(query, filter_clauses):
+    """bool query matching the inference-backed semantic_text field."""
+    return {
+        "bool": {
+            "filter": filter_clauses,
+            "must": [{"semantic": {"field": SEMANTIC_FIELD, "query": query}}],
+        }
+    }
+
+
+def malformed_query_response(exc):
+    """400 for a query ES rejected. Logs the detail but doesn't leak ES
+    internals (field paths, index names) to the client."""
+    access_log.warning(
+        "malformed_query",
+        extra={"request_id": getattr(g, "request_id", None), "detail": str(exc)},
+    )
+    return jsonify({"error": "malformed query"}), 400
+
 @app.route("/index", methods=["GET"])
 def index():
     start = time.time()
@@ -407,13 +442,22 @@ def get_filter_from_args(args):
         filters.append({"terms": {"grade": grade}})
     return filters
 
+def _resolve_search_mode(args):
+    """Resolve the ?mode= arg, falling a semantic-backed mode back to lexical
+    when SEMANTIC_SEARCH_ENABLED is off — so a deploy without an inference
+    endpoint degrades gracefully instead of erroring."""
+    mode = args.get("mode", "lexical").lower()
+    if mode not in SEARCH_MODES:
+        mode = "lexical"
+    if mode in SEMANTIC_MODES and not SEMANTIC_ENABLED:
+        return "lexical"
+    return mode
+
 @app.route("/<language>/search", methods=["GET"])
 def search(language):
     query = request.args.get("q")
     filter = get_filter_from_args(request.args)
-    use_semantic = SEMANTIC_ENABLED and request.args.get(
-        "semantic", ""
-    ).lower() in ("1", "true", "yes")
+    mode = _resolve_search_mode(request.args)
 
     fields = ["hadithNumber^2", "hadithText", "arabicText", "collection^2"]
 
@@ -441,17 +485,20 @@ def search(language):
             }
         }
 
-    if use_semantic:
+    if mode in SEMANTIC_MODES:
         access_log.info(
-            "semantic_search_enabled",
+            "semantic_search_mode",
             extra={
                 "request_id": getattr(g, "request_id", None),
                 "language": language,
                 "query": query,
                 "filters": filter,
+                "mode": mode,
             },
         )
-        return _semantic_rrf_search(language, query, filter, build_query)
+        if mode == "hybrid":
+            return _semantic_rrf_search(language, query, filter, build_query)
+        return _semantic_only_search(language, query, filter)
 
     search_kwargs = {
         "index": language,
@@ -459,15 +506,7 @@ def search(language):
         "size": request.args.get("size", 10),
         "_source": {"excludes": [SEMANTIC_FIELD]},
         "highlight": {"number_of_fragments": 0, "fields": {"*": {}}},
-        "suggest": {
-            "text": query,
-            "english": {
-                "phrase": get_suggest_query("hadithText.trigram"),
-            },
-            "arabic": {
-                "phrase": get_suggest_query("arabicText"),
-            },
-        },
+        "suggest": get_suggest_block(query),
     }
 
     try:
@@ -477,15 +516,7 @@ def search(language):
             # query_string syntax is strict; retry once with simple_query_string, which tolerates malformed input
             result = es_client.search(query=build_query("simple_query_string"), **search_kwargs)
     except BadRequestError as e:
-        # Don't leak ES internals (field paths, index names) to client.
-        access_log.warning(
-            "malformed_query",
-            extra={
-                "request_id": getattr(g, "request_id", None),
-                "detail": str(e),
-            },
-        )
-        return jsonify({"error": "malformed query"}), 400
+        return malformed_query_response(e)
 
     return jsonify(result.body)
 
@@ -499,12 +530,7 @@ def _semantic_rrf_search(language, query, filter_clauses, build_lexical_query):
     size = int(request.args.get("size", 10))
     window = max(RRF_WINDOW, from_ + size)
 
-    semantic_query = {
-        "bool": {
-            "filter": filter_clauses,
-            "must": [{"semantic": {"field": SEMANTIC_FIELD, "query": query}}],
-        }
-    }
+    semantic_query = build_semantic_query(query, filter_clauses)
     # The semantic_text field stores chunked embeddings + a copy of the input
     # text; excluding it keeps responses lean.
     common_body = {
@@ -518,11 +544,7 @@ def _semantic_rrf_search(language, query, filter_clauses, build_lexical_query):
     lexical_body = {
         **common_body,
         "highlight": {"number_of_fragments": 0, "fields": {"*": {}}},
-        "suggest": {
-            "text": query,
-            "english": {"phrase": get_suggest_query("hadithText.trigram")},
-            "arabic": {"phrase": get_suggest_query("arabicText")},
-        },
+        "suggest": get_suggest_block(query),
     }
 
     def _run(query_type):
@@ -542,11 +564,7 @@ def _semantic_rrf_search(language, query, filter_clauses, build_lexical_query):
             # user's query as a syntax.
             result = _run("simple_query_string")
     except BadRequestError as e:
-        access_log.warning(
-            "malformed_query",
-            extra={"request_id": getattr(g, "request_id", None), "detail": str(e)},
-        )
-        return jsonify({"error": "malformed query"}), 400
+        return malformed_query_response(e)
 
     lex_resp, sem_resp = result["responses"][0], result["responses"][1]
     access_log.info(
@@ -584,6 +602,24 @@ def _semantic_rrf_search(language, query, filter_clauses, build_lexical_query):
         },
     )
     return jsonify(merged)
+
+
+def _semantic_only_search(language, query, filter_clauses):
+    """Single semantic query against the semantic_text field — no lexical leg
+    and no RRF fusion, so collection boosts (a function_score wrapper) don't
+    apply and there's no highlight (a semantic_text field can't be highlighted)."""
+    try:
+        result = es_client.options(request_timeout=130).search(
+            index=language,
+            from_=int(request.args.get("from", 0)),
+            size=int(request.args.get("size", 10)),
+            query=build_semantic_query(query, filter_clauses),
+            _source={"excludes": [SEMANTIC_FIELD]},
+            suggest=get_suggest_block(query),
+        )
+    except BadRequestError as e:
+        return malformed_query_response(e)
+    return jsonify(result.body)
 
 
 if __name__ == "__main__":
