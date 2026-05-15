@@ -66,14 +66,23 @@ es_client = Elasticsearch(
     request_timeout=10,
 )
 
+def _is_truthy(value):
+    """Parse an env var / query param flag the same way everywhere."""
+    return (value or "").lower() in ("1", "true", "yes")
+
+
 INDEX_NAME = "english"
 
-SEMANTIC_ENABLED = os.environ.get("SEMANTIC_SEARCH_ENABLED", "").lower() in ("1", "true", "yes")
+SEMANTIC_ENABLED = _is_truthy(os.environ.get("SEMANTIC_SEARCH_ENABLED"))
 SEMANTIC_FIELD = "hadithTextSemantic"
-# Per-doc content hash stored alongside each document. An incremental reindex
-# diffs incoming docs against this to skip re-embedding unchanged hadiths.
+# Per-doc content hash; an incremental reindex diffs against it. See _content_hash.
 CONTENT_HASH_FIELD = "contentHash"
 INFERENCE_ENDPOINT = "openai-text-embedding"
+# helpers.bulk timeout. With semantic_text in the mapping each doc triggers an
+# OpenAI embedding call during indexing, so the request needs far longer than a
+# plain bulk. Indexing stays single-stream on purpose: OpenAI's tokens-per-minute
+# quota is the ceiling, so fanning out across threads just trips 429s.
+BULK_REQUEST_TIMEOUT = 300 if SEMANTIC_ENABLED else 60
 # RRF constants. k=60 is the value from the original Cormack et al. paper and
 # the ES default. RRF_WINDOW is the depth fetched from each retriever before
 # fusion — bigger window = better recall at the tail, more cost per query.
@@ -179,7 +188,20 @@ def _prepare_documents(documents):
     for doc in documents:
         doc["_id"] = f"{doc['lang']}:{doc['urn']}"
         doc[CONTENT_HASH_FIELD] = _content_hash(doc)
-    return documents
+
+
+def _bulk_index(actions, index):
+    """helpers.bulk with the project's standard flags: a timeout long enough
+    for the semantic_text embedding calls, and errors collected per-doc rather
+    than raised so a partial failure still reports."""
+    return helpers.bulk(
+        es_client,
+        actions,
+        index=index,
+        request_timeout=BULK_REQUEST_TIMEOUT,
+        raise_on_error=False,
+        raise_on_exception=False,
+    )
 
 
 def _index_supports_incremental():
@@ -191,10 +213,12 @@ def _index_supports_incremental():
         mapping = es_client.indices.get_mapping(index=INDEX_NAME)
     except NotFoundError:
         return False
+    if not mapping:
+        return False
     return all(
         CONTENT_HASH_FIELD in index_def.get("mappings", {}).get("properties", {})
         for index_def in mapping.values()
-    ) and bool(mapping)
+    )
 
 
 def create_and_update_index(documents, fields_to_not_index):
@@ -298,25 +322,13 @@ def create_and_update_index(documents, fields_to_not_index):
     es_client.indices.create(index=new_index, mappings=mappings, settings=settings)
 
     _prepare_documents(documents)
-
-    # When semantic_text is in the mapping each doc triggers an embedding API
-    # call during indexing, so the bulk request needs a longer timeout. Indexing
-    # stays single-stream: OpenAI's tokens-per-minute quota is the ceiling for
-    # the embedding calls, so fanning out just trips 429s without going faster.
-    bulk_timeout = 300 if SEMANTIC_ENABLED else 60
-    successCount, errors = helpers.bulk(
-        es_client,
-        documents,
-        index=new_index,
-        request_timeout=bulk_timeout,
-        raise_on_error=False,
-        raise_on_exception=False,
-    )
+    successCount, errors = _bulk_index(documents, new_index)
+    result = {"mode": "rebuild", "success_count": successCount, "errors": errors}
 
     # Don't swap an empty/failed build over a working index.
     if successCount == 0:
         es_client.indices.delete(index=new_index, ignore_unavailable=True)
-        return successCount, errors
+        return result
 
     # Find whatever currently serves the alias so we can retire it after the swap.
     old_indices = []
@@ -337,7 +349,7 @@ def create_and_update_index(documents, fields_to_not_index):
     for old in old_indices:
         es_client.indices.delete(index=old, ignore_unavailable=True)
 
-    return successCount, errors
+    return result
 
 
 def incremental_update_index(documents):
@@ -376,21 +388,14 @@ def incremental_update_index(documents):
     ]
     to_delete = [doc_id for doc_id in existing_hashes if doc_id not in incoming]
 
-    actions = list(to_index) + [
+    actions = to_index + [
         {"_op_type": "delete", "_id": doc_id} for doc_id in to_delete
     ]
     success_count, errors = 0, []
     if actions:
-        bulk_timeout = 300 if SEMANTIC_ENABLED else 60
-        success_count, errors = helpers.bulk(
-            es_client,
-            actions,
-            index=INDEX_NAME,
-            request_timeout=bulk_timeout,
-            raise_on_error=False,
-            raise_on_exception=False,
-        )
+        success_count, errors = _bulk_index(actions, INDEX_NAME)
     return {
+        "mode": "incremental",
         "indexed": len(to_index),
         "deleted": len(to_delete),
         "unchanged": len(incoming) - len(to_index),
@@ -504,27 +509,12 @@ def index():
     # Full rebuild when explicitly asked (?rebuild=true — needed after a
     # mapping/analysis change) or when there's no current-format index to diff
     # against. Otherwise diff against the live index and touch only what changed.
-    rebuild = request.args.get("rebuild", "").lower() in ("1", "true", "yes")
-    if rebuild or not _index_supports_incremental():
-        successCount, errors = create_and_update_index(
-            documents, ["urn", "matchingArabicURN", "lang"]
-        )
-        result = {
-            "mode": "rebuild",
-            "success_count": successCount,
-            "failed": json.dumps(errors),
-        }
+    if _is_truthy(request.args.get("rebuild")) or not _index_supports_incremental():
+        result = create_and_update_index(documents, ["urn", "matchingArabicURN", "lang"])
     else:
-        stats = incremental_update_index(documents)
-        result = {
-            "mode": "incremental",
-            "indexed": stats["indexed"],
-            "deleted": stats["deleted"],
-            "unchanged": stats["unchanged"],
-            "success_count": stats["success_count"],
-            "failed": json.dumps(stats["errors"]),
-        }
+        result = incremental_update_index(documents)
 
+    result["failed"] = json.dumps(result.pop("errors"))
     result["arabic_only"] = {"count": len(arabicOnlyHadiths)}
     result["timeInSeconds"] = time.time() - start
     return result
