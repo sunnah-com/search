@@ -69,7 +69,7 @@ INDEX_NAME = "english"
 
 SEMANTIC_ENABLED = os.environ.get("SEMANTIC_SEARCH_ENABLED", "").lower() in ("1", "true", "yes")
 SEMANTIC_FIELD = "hadithTextSemantic"
-INFERENCE_ENDPOINT = "googleai-text-embedding"
+INFERENCE_ENDPOINT = "openai-text-embedding"
 # RRF constants. k=60 is the value from the original Cormack et al. paper and
 # the ES default. RRF_WINDOW is the depth fetched from each retriever before
 # fusion — bigger window = better recall at the tail, more cost per query.
@@ -116,9 +116,9 @@ def home():
 
 
 def create_inference_endpoint():
-    """Create the Google AI Studio text-embedding inference endpoint used by
-    the semantic_text field. Deletes any existing endpoint with the same id
-    so re-indexing picks up dimension/model changes."""
+    """Create the OpenAI text-embedding inference endpoint used by the
+    semantic_text field. Deletes any existing endpoint with the same id so
+    re-indexing picks up dimension/model changes."""
     try:
         es_client.inference.delete(
             task_type="text_embedding",
@@ -131,10 +131,14 @@ def create_inference_endpoint():
         task_type="text_embedding",
         inference_id=INFERENCE_ENDPOINT,
         inference_config={
-            "service": "googleaistudio",
+            "service": "openai",
             "service_settings": {
-                "api_key": os.environ.get("GOOGLE_AI_STUDIO_API_KEY"),
-                "model_id": "text-embedding-005",
+                "api_key": os.environ.get("OPENAI_API_KEY"),
+                "model_id": "text-embedding-3-small",
+                # OpenAI vectors are mathematically unit-length but drift past
+                # ES's strict epsilon for a small fraction of inputs, breaking
+                # the default dot_product similarity. See elastic/elasticsearch#122878.
+                "similarity": "cosine",
             },
         },
     )
@@ -239,7 +243,12 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
     # call during indexing, so the bulk request needs a longer timeout.
     bulk_timeout = 300 if SEMANTIC_ENABLED else 60
     successCount, errors = helpers.bulk(
-        es_client, documents, index=index_name, request_timeout=bulk_timeout
+        es_client,
+        documents,
+        index=index_name,
+        request_timeout=bulk_timeout,
+        raise_on_error=False,
+        raise_on_exception=False,
     )
     return successCount, errors
 
@@ -433,12 +442,22 @@ def search(language):
         }
 
     if use_semantic:
+        access_log.info(
+            "semantic_search_enabled",
+            extra={
+                "request_id": getattr(g, "request_id", None),
+                "language": language,
+                "query": query,
+                "filters": filter,
+            },
+        )
         return _semantic_rrf_search(language, query, filter, build_query)
 
     search_kwargs = {
         "index": language,
         "from_": request.args.get("from", 0),
         "size": request.args.get("size", 10),
+        "_source": {"excludes": [SEMANTIC_FIELD]},
         "highlight": {"number_of_fragments": 0, "fields": {"*": {}}},
         "suggest": {
             "text": query,
@@ -530,6 +549,17 @@ def _semantic_rrf_search(language, query, filter_clauses, build_lexical_query):
         return jsonify({"error": "malformed query"}), 400
 
     lex_resp, sem_resp = result["responses"][0], result["responses"][1]
+    access_log.info(
+        "semantic_rrf_legs",
+        extra={
+            "request_id": getattr(g, "request_id", None),
+            "lexical_hits": len(lex_resp.get("hits", {}).get("hits", [])),
+            "semantic_hits": len(sem_resp.get("hits", {}).get("hits", [])),
+            "lexical_took_ms": lex_resp.get("took"),
+            "semantic_took_ms": sem_resp.get("took"),
+            "window": window,
+        },
+    )
     for resp, label in ((lex_resp, "lexical"), (sem_resp, "semantic")):
         if resp.get("error"):
             access_log.warning(
@@ -542,7 +572,18 @@ def _semantic_rrf_search(language, query, filter_clauses, build_lexical_query):
             )
             return jsonify({"error": "malformed query"}), 400
 
-    return jsonify(_rrf_merge(lex_resp, sem_resp, RRF_K, from_, size))
+    merged = _rrf_merge(lex_resp, sem_resp, RRF_K, from_, size)
+    access_log.info(
+        "semantic_rrf_merged",
+        extra={
+            "request_id": getattr(g, "request_id", None),
+            "returned_hits": len(merged["hits"]["hits"]),
+            "max_score": merged["hits"]["max_score"],
+            "from": from_,
+            "size": size,
+        },
+    )
+    return jsonify(merged)
 
 
 if __name__ == "__main__":
