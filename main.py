@@ -67,6 +67,15 @@ es_client = Elasticsearch(
 
 INDEX_NAME = "english"
 
+SEMANTIC_ENABLED = os.environ.get("SEMANTIC_SEARCH_ENABLED", "").lower() in ("1", "true", "yes")
+SEMANTIC_FIELD = "hadithTextSemantic"
+INFERENCE_ENDPOINT = "googleai-text-embedding"
+# RRF constants. k=60 is the value from the original Cormack et al. paper and
+# the ES default. RRF_WINDOW is the depth fetched from each retriever before
+# fusion — bigger window = better recall at the tail, more cost per query.
+RRF_K = 60
+RRF_WINDOW = 100
+
 # Tiebreaker boosts added on top of the text-similarity score so canonical
 # collections rise when relevance is otherwise comparable. Sized to swing
 # rankings when BM25 scores are within a few points (e.g. the same hadith
@@ -104,6 +113,31 @@ def _handle_unexpected(exc):
 @app.route("/", methods=["GET"])
 def home():
     return "<h1>Welcome to sunnah.com search api.</h1>"
+
+
+def create_inference_endpoint():
+    """Create the Google AI Studio text-embedding inference endpoint used by
+    the semantic_text field. Deletes any existing endpoint with the same id
+    so re-indexing picks up dimension/model changes."""
+    try:
+        es_client.inference.delete(
+            task_type="text_embedding",
+            inference_id=INFERENCE_ENDPOINT,
+            force=True,
+        )
+    except NotFoundError:
+        pass
+    es_client.options(request_timeout=60).inference.put(
+        task_type="text_embedding",
+        inference_id=INFERENCE_ENDPOINT,
+        inference_config={
+            "service": "googleaistudio",
+            "service_settings": {
+                "api_key": os.environ.get("GOOGLE_AI_STUDIO_API_KEY"),
+                "model_id": "text-embedding-005",
+            },
+        },
+    )
 
 
 def create_and_update_index(index_name, documents, fields_to_not_index):
@@ -193,10 +227,20 @@ def create_and_update_index(index_name, documents, fields_to_not_index):
         }
         | {"arabicText": {"type": "text", "analyzer": "custom_arabic"}}
     }
+    if SEMANTIC_ENABLED:
+        mappings["properties"][SEMANTIC_FIELD] = {
+            "type": "semantic_text",
+            "inference_id": INFERENCE_ENDPOINT,
+        }
     if es_client.indices.exists(index=index_name):
         es_client.indices.delete(index=index_name)
     es_client.indices.create(index=index_name, mappings=mappings, settings=settings)
-    successCount, errors = helpers.bulk(es_client, documents, index=index_name)
+    # When semantic_text is in the mapping each doc triggers an embedding API
+    # call during indexing, so the bulk request needs a longer timeout.
+    bulk_timeout = 300 if SEMANTIC_ENABLED else 60
+    successCount, errors = helpers.bulk(
+        es_client, documents, index=index_name, request_timeout=bulk_timeout
+    )
     return successCount, errors
 
 def get_suggest_query(suggest_field):
@@ -224,6 +268,9 @@ def index():
     start = time.time()
     if request.args.get("password") != os.environ.get("INDEXING_PASSWORD"):
         return "Must provide valid password to index", 401
+
+    if SEMANTIC_ENABLED:
+        create_inference_endpoint()
 
     connection = pymysql.connect(
         host=os.environ.get("MYSQL_HOST"),
@@ -257,6 +304,8 @@ def index():
 
     # Add arabic text and hadithNumber to english hadith
     for englishHadith in englishHadiths:
+        if SEMANTIC_ENABLED:
+            englishHadith[SEMANTIC_FIELD] = englishHadith["hadithText"]
         if englishHadith["urn"] not in matchingArabicHadiths:
            continue
         matchingArabic = matchingArabicHadiths[englishHadith["urn"]]
@@ -303,6 +352,41 @@ def index_status():
     }
 
 
+def _rrf_merge(lexical_resp, semantic_resp, k, from_, size):
+    """Reciprocal rank fusion of two ES result sets. Each doc's fused score
+    is sum(1/(k+rank)) across retrievers it appears in; rank is 1-indexed."""
+    scores = {}
+    hits_by_id = {}
+    for rank, h in enumerate(lexical_resp.get("hits", {}).get("hits", []), start=1):
+        doc_id = h["_id"]
+        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+        # Lexical hits own the highlight slot — semantic queries don't produce one.
+        hits_by_id[doc_id] = h
+    for rank, h in enumerate(semantic_resp.get("hits", {}).get("hits", []), start=1):
+        doc_id = h["_id"]
+        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+        hits_by_id.setdefault(doc_id, h)
+
+    sorted_ids = sorted(scores, key=scores.get, reverse=True)
+    merged_hits = []
+    for doc_id in sorted_ids[from_ : from_ + size]:
+        h = dict(hits_by_id[doc_id])
+        h["_score"] = scores[doc_id]
+        merged_hits.append(h)
+
+    # Lexical total is the keyword-match count and stays comparable to the
+    # non-semantic path; semantic returns top-N by similarity with no total.
+    total = lexical_resp.get("hits", {}).get(
+        "total", {"value": len(sorted_ids), "relation": "eq"}
+    )
+    max_score = scores[sorted_ids[0]] if sorted_ids else None
+    return {
+        "took": lexical_resp.get("took", 0) + semantic_resp.get("took", 0),
+        "hits": {"total": total, "max_score": max_score, "hits": merged_hits},
+        "suggest": lexical_resp.get("suggest"),
+    }
+
+
 def get_filter_from_args(args):
     filters = []
     collection = args.getlist("collection")
@@ -318,6 +402,9 @@ def get_filter_from_args(args):
 def search(language):
     query = request.args.get("q")
     filter = get_filter_from_args(request.args)
+    use_semantic = SEMANTIC_ENABLED and request.args.get(
+        "semantic", ""
+    ).lower() in ("1", "true", "yes")
 
     fields = ["hadithNumber^2", "hadithText", "arabicText", "collection^2"]
 
@@ -344,6 +431,9 @@ def search(language):
                 "boost_mode": "sum",
             }
         }
+
+    if use_semantic:
+        return _semantic_rrf_search(language, query, filter, build_query)
 
     search_kwargs = {
         "index": language,
@@ -379,6 +469,80 @@ def search(language):
         return jsonify({"error": "malformed query"}), 400
 
     return jsonify(result.body)
+
+
+def _semantic_rrf_search(language, query, filter_clauses, build_lexical_query):
+    """Run lexical + semantic searches in parallel via msearch and fuse with RRF.
+    Lexical query keeps the function_score collection boosts; semantic uses the
+    inference-backed semantic_text field. Fusion happens in Python to avoid the
+    Enterprise-licensed RRF retriever."""
+    from_ = int(request.args.get("from", 0))
+    size = int(request.args.get("size", 10))
+    window = max(RRF_WINDOW, from_ + size)
+
+    semantic_query = {
+        "bool": {
+            "filter": filter_clauses,
+            "must": [{"semantic": {"field": SEMANTIC_FIELD, "query": query}}],
+        }
+    }
+    # The semantic_text field stores chunked embeddings + a copy of the input
+    # text; excluding it keeps responses lean.
+    common_body = {
+        "from": 0,
+        "size": window,
+        "_source": {"excludes": [SEMANTIC_FIELD]},
+    }
+    # Highlight + suggest run on the lexical leg only — _rrf_merge keeps the
+    # lexical hit for any doc that appears in both legs, so a semantic-leg
+    # highlight would be computed and then discarded.
+    lexical_body = {
+        **common_body,
+        "highlight": {"number_of_fragments": 0, "fields": {"*": {}}},
+        "suggest": {
+            "text": query,
+            "english": {"phrase": get_suggest_query("hadithText.trigram")},
+            "arabic": {"phrase": get_suggest_query("arabicText")},
+        },
+    }
+
+    def _run(query_type):
+        searches = [
+            {"index": language},
+            {**lexical_body, "query": build_lexical_query(query_type)},
+            {"index": language},
+            {**common_body, "query": semantic_query},
+        ]
+        return es_client.options(request_timeout=130).msearch(searches=searches)
+
+    try:
+        result = _run("query_string")
+        if result["responses"][0].get("error"):
+            # Only the lexical leg can hit query_string strictness; the
+            # semantic leg uses a `semantic` clause that doesn't parse the
+            # user's query as a syntax.
+            result = _run("simple_query_string")
+    except BadRequestError as e:
+        access_log.warning(
+            "malformed_query",
+            extra={"request_id": getattr(g, "request_id", None), "detail": str(e)},
+        )
+        return jsonify({"error": "malformed query"}), 400
+
+    lex_resp, sem_resp = result["responses"][0], result["responses"][1]
+    for resp, label in ((lex_resp, "lexical"), (sem_resp, "semantic")):
+        if resp.get("error"):
+            access_log.warning(
+                "rrf_subquery_failed",
+                extra={
+                    "request_id": getattr(g, "request_id", None),
+                    "leg": label,
+                    "error": resp["error"],
+                },
+            )
+            return jsonify({"error": "malformed query"}), 400
+
+    return jsonify(_rrf_merge(lex_resp, sem_resp, RRF_K, from_, size))
 
 
 if __name__ == "__main__":
