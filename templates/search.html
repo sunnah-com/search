@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sunnah Search — Embedding Testbed</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #f0f0f0; color: #1a1a1a; min-height: 100vh; }
+
+    /* ── Header ─────────────────────────────────────────────── */
+    header {
+      background: #1a1a2e;
+      color: #fff;
+      padding: 16px 24px 14px;
+      position: sticky; top: 0; z-index: 10;
+      box-shadow: 0 2px 8px rgba(0,0,0,.4);
+    }
+    header h1 { font-size: 14px; font-weight: 500; color: #aaa; letter-spacing: .5px; margin-bottom: 10px; text-transform: uppercase; }
+    .search-row { display: flex; gap: 8px; }
+    .search-row input {
+      flex: 1; padding: 9px 14px; border-radius: 6px; border: none;
+      font-size: 15px; background: #fff; color: #111;
+    }
+    .search-row input:focus { outline: 2px solid #e94560; }
+    .search-row button {
+      padding: 9px 22px; background: #e94560; color: #fff;
+      border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600;
+    }
+    .search-row button:hover { background: #c73050; }
+
+    /* ── Controls bar ───────────────────────────────────────── */
+    .controls {
+      background: #fff; border-bottom: 1px solid #ddd;
+      padding: 10px 24px; display: flex; gap: 20px; align-items: center; flex-wrap: wrap;
+    }
+    .ctrl-group { display: flex; align-items: center; gap: 6px; }
+    .ctrl-group label { font-size: 12px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: .4px; white-space: nowrap; }
+    .pill {
+      padding: 4px 13px; border-radius: 20px; border: 1.5px solid #ccc;
+      background: #fff; cursor: pointer; font-size: 12px; color: #555;
+      transition: all .12s; white-space: nowrap;
+    }
+    .pill:hover:not(:disabled) { border-color: #e94560; color: #e94560; }
+    .pill.active { background: #e94560; color: #fff; border-color: #e94560; }
+    .pill:disabled { opacity: .35; cursor: not-allowed; }
+    .pill[data-state="not-indexed"] { border-style: dashed; opacity: .55; }
+    .pill[data-state="not-indexed"]::after { content: ' ·'; }
+    .ctrl-group.compare-group { margin-left: auto; }
+
+    /* ── Results layout ─────────────────────────────────────── */
+    .results-wrap { max-width: 1440px; margin: 0 auto; padding: 20px 24px; }
+    .panels { display: grid; grid-template-columns: 1fr; gap: 20px; }
+    .panels.two-col { grid-template-columns: 1fr 1fr; }
+
+    .panel-header {
+      display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px;
+    }
+    .panel-title { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: #555; }
+    .panel-count { font-size: 12px; color: #aaa; }
+
+    /* ── Result cards ───────────────────────────────────────── */
+    .card {
+      background: #fff; border-radius: 8px; padding: 14px 16px;
+      margin-bottom: 10px; border: 1px solid #e4e4e4;
+    }
+    .card-meta { display: flex; justify-content: space-between; margin-bottom: 6px; align-items: center; }
+    .card-collection { font-size: 11px; font-weight: 700; color: #e94560; text-transform: uppercase; letter-spacing: .5px; }
+    .card-score { font-size: 11px; color: #bbb; font-family: monospace; }
+    .card-text { font-size: 14px; line-height: 1.65; color: #222; }
+    .card-text em { background: #fff3cd; font-style: normal; border-radius: 2px; padding: 0 1px; }
+    .card-arabic {
+      font-size: 15px; line-height: 1.9; color: #555; direction: rtl; text-align: right;
+      margin-top: 8px; padding-top: 8px; border-top: 1px solid #f0f0f0;
+    }
+
+    .empty { color: #aaa; font-size: 14px; text-align: center; padding: 40px 0; }
+    .error-box { background: #fff0f0; border: 1px solid #fcc; border-radius: 8px; padding: 14px; color: #b00; font-size: 13px; }
+
+    /* ── Spinner ────────────────────────────────────────────── */
+    .spinner { text-align: center; padding: 40px; color: #bbb; font-size: 13px; }
+    .spinner::after { content: ''; display: inline-block; width: 18px; height: 18px; border: 2px solid #ddd; border-top-color: #e94560; border-radius: 50%; animation: spin .7s linear infinite; vertical-align: middle; margin-left: 8px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Sunnah Search — Embedding Testbed</h1>
+  <div class="search-row">
+    <input type="text" id="q" placeholder="Search hadith…" autofocus>
+    <button onclick="doSearch()">Search</button>
+  </div>
+</header>
+
+<div class="controls">
+  <div class="ctrl-group">
+    <label>Mode</label>
+    <button class="pill active" data-mode="lexical" onclick="setMode(this)">Lexical</button>
+    <button class="pill" data-mode="hybrid" onclick="setMode(this)" id="btn-hybrid" disabled>Hybrid</button>
+    <button class="pill" data-mode="semantic" onclick="setMode(this)" id="btn-semantic" disabled>Semantic</button>
+  </div>
+
+  <div class="ctrl-group" id="model-group" style="display:none">
+    <label>Model</label>
+    <!-- populated on load -->
+  </div>
+
+  <div class="ctrl-group compare-group">
+    <label>Compare</label>
+    <button class="pill" id="compare-btn" onclick="toggleCompare(this)">vs Lexical</button>
+  </div>
+</div>
+
+<div class="results-wrap">
+  <div class="panels" id="panels">
+    <div id="panel-a"></div>
+    <div id="panel-b" style="display:none"></div>
+  </div>
+</div>
+
+<script>
+  let mode = 'lexical';
+  let modelKey = null;
+  let compare = false;
+  let allModels = {};
+
+  // ── Boot: fetch model list ──────────────────────────────────
+  fetch('/api/models').then(r => r.json()).then(data => {
+    allModels = data;
+    const group = document.getElementById('model-group');
+    let firstEnabled = null;
+
+    Object.entries(data).forEach(([key, m], i) => {
+      const btn = document.createElement('button');
+      btn.className = 'pill';
+      btn.dataset.model = key;
+      btn.onclick = () => setModel(btn);
+
+      const ready = m.enabled && m.indexed;
+      const needsIndex = m.enabled && !m.indexed;
+
+      btn.disabled = !ready;
+      btn.dataset.state = needsIndex ? 'not-indexed' : (ready ? 'ready' : 'disabled');
+      btn.title = needsIndex
+        ? `${m.label} — enabled but not yet indexed. Run /index?model=${key} to build it.`
+        : m.label;
+      btn.textContent = needsIndex ? `${m.label} (not indexed)` : m.label;
+
+      group.appendChild(btn);
+      if (ready && firstEnabled === null) {
+        firstEnabled = key;
+        btn.classList.add('active');
+      }
+    });
+
+    modelKey = firstEnabled;
+    if (firstEnabled) {
+      document.getElementById('btn-hybrid').disabled = false;
+      document.getElementById('btn-semantic').disabled = false;
+    }
+  });
+
+  // ── Controls ────────────────────────────────────────────────
+  function setMode(btn) {
+    mode = btn.dataset.mode;
+    document.querySelectorAll('[data-mode]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const modelGroup = document.getElementById('model-group');
+    modelGroup.style.display = (mode !== 'lexical') ? 'flex' : 'none';
+    if (document.getElementById('q').value.trim()) doSearch();
+  }
+
+  function setModel(btn) {
+    modelKey = btn.dataset.model;
+    document.querySelectorAll('#model-group .pill').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    if (document.getElementById('q').value.trim()) doSearch();
+  }
+
+  function toggleCompare(btn) {
+    compare = !compare;
+    btn.classList.toggle('active', compare);
+    document.getElementById('panels').classList.toggle('two-col', compare);
+    const panelB = document.getElementById('panel-b');
+    panelB.style.display = compare ? 'block' : 'none';
+    if (compare && document.getElementById('q').value.trim()) doSearch();
+  }
+
+  document.getElementById('q').addEventListener('keydown', e => {
+    if (e.key === 'Enter') doSearch();
+  });
+
+  // ── Search ──────────────────────────────────────────────────
+  function doSearch() {
+    const q = document.getElementById('q').value.trim();
+    if (!q) return;
+
+    const params = new URLSearchParams({ q, size: 10 });
+    if (mode !== 'lexical') {
+      params.set('mode', mode);
+      if (modelKey) params.set('model', modelKey);
+    }
+
+    setPanel('panel-a', null); // loading
+    fetchAndRender(`/english/search?${params}`, 'panel-a', mode, modelKey);
+
+    if (compare) {
+      setPanel('panel-b', null);
+      fetchAndRender(
+        `/english/search?${new URLSearchParams({ q, size: 10 })}`,
+        'panel-b', 'lexical', null
+      );
+    }
+  }
+
+  async function fetchAndRender(url, panelId, searchMode, mKey) {
+    try {
+      const resp = await fetch(url);
+      const data = await resp.json();
+      renderPanel(panelId, data, searchMode, mKey);
+    } catch (e) {
+      document.getElementById(panelId).innerHTML =
+        `<div class="error-box">Fetch error: ${e.message}</div>`;
+    }
+  }
+
+  // ── Rendering ───────────────────────────────────────────────
+  function setPanel(panelId, html) {
+    document.getElementById(panelId).innerHTML =
+      html === null ? '<div class="spinner">Searching</div>' : html;
+  }
+
+  function modeLabel(searchMode, mKey) {
+    if (searchMode === 'lexical') return 'Lexical (BM25)';
+    const modelLabel = mKey && allModels[mKey] ? allModels[mKey].label : '';
+    if (searchMode === 'hybrid') return `Hybrid RRF — ${modelLabel}`;
+    return `Semantic — ${modelLabel}`;
+  }
+
+  function renderPanel(panelId, data, searchMode, mKey) {
+    if (data.error) {
+      setPanel(panelId, `<div class="error-box">${data.error}</div>`);
+      return;
+    }
+
+    const hits = data.hits?.hits ?? [];
+    const total = data.hits?.total?.value ?? 0;
+
+    let html = `
+      <div class="panel-header">
+        <span class="panel-title">${modeLabel(searchMode, mKey)}</span>
+        <span class="panel-count">${total.toLocaleString()} results</span>
+      </div>`;
+
+    if (hits.length === 0) {
+      html += '<div class="empty">No results found.</div>';
+    } else {
+      for (const hit of hits) {
+        const src = hit._source ?? {};
+        const hl  = hit.highlight ?? {};
+        const text = hl.hadithText?.[0] ?? src.hadithText ?? '';
+        const arabic = src.arabicText ?? '';
+        const coll = src.collection ?? '';
+        const num  = src.hadithNumber ? ` · ${src.hadithNumber}` : '';
+        const score = hit._score != null ? hit._score.toFixed(4) : '—';
+        const excerpt = text.length > 350 ? text.slice(0, 350) + '…' : text;
+        const arExcerpt = arabic.length > 220 ? arabic.slice(0, 220) + '…' : arabic;
+
+        html += `
+          <div class="card">
+            <div class="card-meta">
+              <span class="card-collection">${coll}${num}</span>
+              <span class="card-score">${score}</span>
+            </div>
+            <div class="card-text">${excerpt}</div>
+            ${arExcerpt ? `<div class="card-arabic">${arExcerpt}</div>` : ''}
+          </div>`;
+      }
+    }
+
+    setPanel(panelId, html);
+  }
+</script>
+</body>
+</html>
