@@ -53,6 +53,7 @@ loki.process "add_env" {
       path        = "path",
       method      = "method",
       remote_addr = "remote_addr",
+      user_agent  = "user_agent",
     }
   }
 
