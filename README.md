@@ -44,7 +44,7 @@ Each model's index name in ES is an **alias** (e.g. `english-nomic`) that points
 
 ---
 
-## Local setup
+## Local development setup
 
 ### Prerequisites
 
@@ -66,10 +66,7 @@ OPENAI_ENABLED=false   # requires OPENAI_API_KEY
 EMBEDDINGGEMMA_ENABLED=false  # requires --profile embeddinggemma, see below
 ```
 
-If using Ollama and it's not at the default address, set:
-```env
-OLLAMA_URL=http://host.docker.internal:11434
-```
+`OLLAMA_URL` defaults to `http://host.docker.internal:11434`, which works on Docker Desktop (Mac/Windows). Leave it unset locally.
 
 ### 2. Pull Ollama models (if enabled)
 
@@ -84,7 +81,7 @@ ollama pull mxbai-embed-large
 docker compose up --build
 ```
 
-The override file (`docker-compose.override.yml`) is applied automatically and exposes Flask on port 5001.
+`docker-compose.override.yml` is applied automatically and exposes Flask on **port 5001**.
 
 For the embeddinggemma model only:
 ```bash
@@ -94,15 +91,13 @@ This starts the `tei-gemma` service which downloads `google/embeddinggemma-300m`
 
 ### 4. Build the indexes
 
-Open in a browser or curl:
-
 ```
 http://localhost:5001/index?password=index123
 ```
 
 This reads all hadiths from MySQL and builds ES indexes for every enabled model plus the lexical index. It takes a while — embedding ~48k English hadiths per model is the slow part.
 
-To rebuild only one model's index:
+To index only one model:
 ```
 http://localhost:5001/index?password=index123&model=nomic
 http://localhost:5001/index?password=index123&model=lexical
@@ -116,6 +111,73 @@ http://localhost:5001/index?password=index123&rebuild=true
 Check index status (doc counts per index):
 ```
 http://localhost:5001/index/status
+```
+
+---
+
+## Production deployment
+
+Production uses `docker-compose.prod.yml` directly. Key differences from local:
+- **No MySQL service** — connect to the existing external DB via env vars
+- **uwsgi** instead of Flask dev server, exposed on **port 7650**
+- **Persistent ES data** in a named Docker volume (`es-data`)
+- **Explicit ES JVM memory limits** (`-Xms600m -Xmx1g`)
+
+### 1. Configure environment
+
+```bash
+cp .env.sample .env
+```
+
+Fill in the production values — at minimum:
+
+```env
+MYSQL_HOST=<prod db host>
+MYSQL_USER=<user>
+MYSQL_PASSWORD=<password>
+MYSQL_DATABASE=hadithdb
+
+ELASTIC_PASSWORD=<strong password>
+INDEXING_PASSWORD=<strong password>
+
+# Enable whichever models are being evaluated
+NOMIC_ENABLED=true
+MXBAI_ENABLED=true
+```
+
+### 2. Ollama on Linux
+
+Install [Ollama](https://ollama.com) on the host and pull the models before starting the stack:
+
+```bash
+ollama pull nomic-embed-text
+ollama pull mxbai-embed-large
+```
+
+`host.docker.internal` normally only works on Docker Desktop (Mac/Windows), not on Linux. The prod compose file adds `host-gateway` to resolve it correctly on Linux, so the default `OLLAMA_URL` works without any `.env` changes. No action needed.
+
+### 3. Start the stack
+
+```bash
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+### 4. Build the indexes
+
+The prod stack is exposed on **port 7650**:
+
+```
+http://<server>:7650/index?password=<INDEXING_PASSWORD>
+```
+
+To index only one model:
+```
+http://<server>:7650/index?password=<INDEXING_PASSWORD>&model=nomic
+```
+
+Check index status:
+```
+http://<server>:7650/index/status
 ```
 
 ---

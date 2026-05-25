@@ -18,6 +18,11 @@ services:
     # consulted before DNS, so every lookup is instant.
     extra_hosts:
       - "elasticsearch:172.31.250.10"
+      # host.docker.internal resolves automatically on Docker Desktop (Mac/Windows)
+      # but not on Linux. host-gateway is Docker's built-in alias for the host's
+      # IP on the bridge network, making host.docker.internal work on Linux too.
+      # This is what lets the container reach Ollama running on the host.
+      - "host.docker.internal:host-gateway"
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:${ES_STACK_VERSION}
     container_name: elasticsearch
