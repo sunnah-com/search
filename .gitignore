@@ -1,4 +1,4 @@
-db/01-hadithTable.sql
+*.sql
 .env
 __pycache__
 data/
