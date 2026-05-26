@@ -10,9 +10,6 @@ This branch adds **semantic search** alongside the existing lexical (BM25) searc
 
 - **Dedicated lexical index** (`english-lexical`) — separated from the semantic index so it can be rebuilt quickly without re-embedding.
 - **Semantic index** (`english-mxbai`) — `mxbai-embed-large` embeddings via Ollama, English corpus.
-- **Hybrid mode** — lexical and semantic results fused with Reciprocal Rank Fusion (RRF).
-- **Testbed UI** — the API root (`/`) serves a search interface for testing modes without the PHP website.
-- **`/api/models` endpoint** — returns whether the mxbai index is built; the testbed UI calls this on load.
 
 Corresponding website changes (mode toggles in the production UI) are in the `semantic-search-ui-toggles` branch of the website repo.
 
@@ -180,14 +177,12 @@ mxbai runs via **Ollama on the host machine**, not inside Docker. The container 
 
 | Mode | What it does |
 |---|---|
-| `lexical` | BM25 full-text search with collection boosts. Fast, exact keyword matching. |
+| `lexical` | BM25 full-text search with collection boosts. Fast, exact keyword matching. Default. |
 | `semantic` | Embedding similarity via HNSW approximate nearest-neighbor. Finds conceptually related hadiths even without keyword overlap. |
-| `hybrid` | Both legs run in parallel, results fused with Reciprocal Rank Fusion (RRF). |
 
 Mode is passed as a query parameter:
 ```
 /english/search?q=prayer&mode=semantic&model=mxbai
-/english/search?q=prayer&mode=hybrid&model=mxbai
 /english/search?q=prayer&mode=lexical
 ```
 
@@ -197,8 +192,6 @@ Mode is passed as a query parameter:
 
 | Endpoint | Description |
 |---|---|
-| `GET /` | Testbed UI — search interface for testing modes |
-| `GET /api/models` | JSON: configured models + whether each index exists in ES |
 | `GET /<language>/search?q=...` | Main search endpoint (consumed by PHP website) |
 | `GET /index?password=...` | Build/rebuild ES indexes from MySQL |
 | `GET /index/status` | Doc counts for all indexes |

@@ -3,7 +3,7 @@ import logging
 import sys
 import time
 import uuid
-from flask import Flask, request, jsonify, g, render_template
+from flask import Flask, request, jsonify, g
 from werkzeug.exceptions import HTTPException
 import pymysql
 import os
@@ -105,11 +105,8 @@ SEMANTIC_ENABLED = bool(_ENABLED_MODELS)
 # Bulk timeout — embedding calls during indexing are slow.
 BULK_REQUEST_TIMEOUT = 300 if SEMANTIC_ENABLED else 60
 
-RRF_K = 60
-RRF_WINDOW = 100
-
-SEARCH_MODES = ("lexical", "hybrid", "semantic")
-SEMANTIC_MODES = ("hybrid", "semantic")
+SEARCH_MODES = ("lexical", "semantic")
+SEMANTIC_MODES = ("semantic",)
 
 COLLECTION_BOOSTS = [
     ("bukhari", 5.0),
@@ -140,25 +137,7 @@ def _handle_unexpected(exc):
 
 @app.route("/", methods=["GET"])
 def home():
-    return render_template("search.html")
-
-
-@app.route("/api/models", methods=["GET"])
-def get_models():
-    """Return model config + whether each model's index currently exists in ES."""
-    out = {}
-    for key, model in EMBEDDING_MODELS.items():
-        indexed = False
-        if model["enabled"]:
-            try:
-                es_client.indices.exists_alias(name=model["index"]) or \
-                    es_client.indices.exists(index=model["index"])
-                result = es_client.search(index=model["index"], size=0, track_total_hits=True)
-                indexed = result["hits"]["total"]["value"] > 0
-            except Exception:
-                pass
-        out[key] = {"label": model["label"], "enabled": model["enabled"], "indexed": indexed}
-    return jsonify(out)
+    return "<h1>Welcome to sunnah.com search api.</h1>"
 
 
 # ── Index management ──────────────────────────────────────────────────────────
@@ -538,8 +517,6 @@ def search(language):
             "request_id": getattr(g, "request_id", None),
             "mode": mode, "model": model_key, "query": query,
         })
-        if mode == "hybrid":
-            return _hybrid_search(search_index, query, filters, build_lexical, model_key)
         return _semantic_search(search_index, query, filters)
 
     # Lexical path
@@ -561,38 +538,6 @@ def search(language):
     return jsonify(result.body)
 
 
-def _hybrid_search(search_index, query, filters, build_lexical, model_key):
-    from_ = int(request.args.get("from", 0))
-    size = int(request.args.get("size", 10))
-    window = max(RRF_WINDOW, from_ + size)
-    common = {"from": 0, "size": window, "_source": {"excludes": [SEMANTIC_FIELD]}}
-
-    def _run(qt):
-        return es_client.options(request_timeout=130).msearch(searches=[
-            {"index": LEXICAL_INDEX},
-            {**common, "highlight": {"number_of_fragments": 0, "fields": {"*": {}}},
-             "suggest": get_suggest_block(query), "query": build_lexical(qt)},
-            {"index": search_index},
-            {**common, "query": build_semantic_query(query, filters)},
-        ])
-
-    try:
-        result = _run("query_string")
-        if result["responses"][0].get("error"):
-            result = _run("simple_query_string")
-    except BadRequestError as e:
-        return malformed_query_response(e)
-
-    lex, sem = result["responses"][0], result["responses"][1]
-    for resp, label in ((lex, "lexical"), (sem, "semantic")):
-        if resp.get("error"):
-            access_log.warning("rrf_leg_failed", extra={"leg": label, "error": resp["error"]})
-            return jsonify({"error": "malformed query"}), 400
-
-    merged = _rrf_merge(lex, sem, RRF_K, from_, size)
-    return jsonify(merged)
-
-
 def _semantic_search(search_index, query, filters):
     try:
         result = es_client.options(request_timeout=130).search(
@@ -606,31 +551,6 @@ def _semantic_search(search_index, query, filters):
     except BadRequestError as e:
         return malformed_query_response(e)
     return jsonify(result.body)
-
-
-def _rrf_merge(lex_resp, sem_resp, k, from_, size):
-    scores, hits_by_id = {}, {}
-    for rank, h in enumerate(lex_resp.get("hits", {}).get("hits", []), start=1):
-        scores[h["_id"]] = scores.get(h["_id"], 0.0) + 1.0 / (k + rank)
-        hits_by_id[h["_id"]] = h
-    for rank, h in enumerate(sem_resp.get("hits", {}).get("hits", []), start=1):
-        scores[h["_id"]] = scores.get(h["_id"], 0.0) + 1.0 / (k + rank)
-        hits_by_id.setdefault(h["_id"], h)
-
-    sorted_ids = sorted(scores, key=scores.get, reverse=True)
-    merged = []
-    for doc_id in sorted_ids[from_: from_ + size]:
-        h = dict(hits_by_id[doc_id])
-        h["_score"] = scores[doc_id]
-        merged.append(h)
-
-    total = lex_resp.get("hits", {}).get("total", {"value": len(sorted_ids), "relation": "eq"})
-    max_score = scores[sorted_ids[0]] if sorted_ids else None
-    return {
-        "took": lex_resp.get("took", 0) + sem_resp.get("took", 0),
-        "hits": {"total": total, "max_score": max_score, "hits": merged},
-        "suggest": lex_resp.get("suggest"),
-    }
 
 
 if __name__ == "__main__":
