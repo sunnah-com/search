@@ -82,73 +82,18 @@ SEMANTIC_FIELD = "semantic_text"
 _OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://host.docker.internal:11434")
 
 EMBEDDING_MODELS = {
-    "openai-small-en": {
-        "label": "OpenAI small (English)",
-        "index": "english-openai-small",
-        "inference_id": "openai-text-embedding-3-small",  # shared with multilingual variant
-        "enabled": _is_truthy(os.environ.get("OPENAI_ENABLED")),
-        "multilingual": False,
-        "service": "openai",
-        "service_settings": {
-            "api_key": os.environ.get("OPENAI_API_KEY"),
-            "model_id": "text-embedding-3-small",
-            "similarity": "cosine",
-        },
-    },
-    "openai-small-multi": {
-        "label": "OpenAI small (Multilingual)",
-        "index": "multilingual-openai-small",
-        "inference_id": "openai-text-embedding-3-small",  # shared with English variant
-        "enabled": _is_truthy(os.environ.get("OPENAI_ENABLED")),
-        "multilingual": True,  # indexes all Arabic + all English
-        "service": "openai",
-        "service_settings": {
-            "api_key": os.environ.get("OPENAI_API_KEY"),
-            "model_id": "text-embedding-3-small",
-            # cosine safer than dot_product for OpenAI — see elastic/elasticsearch#122878
-            "similarity": "cosine",
-        },
-    },
-    "nomic": {
-        "label": "nomic-embed-text",
-        "index": "english-nomic",
-        "inference_id": "nomic-embed-text",
-        "enabled": _is_truthy(os.environ.get("NOMIC_ENABLED")),
-        "multilingual": False,  # English-only, replicates colleague's original approach
-        # Ollama exposes an OpenAI-compatible API — use that since ES 8.16 has no native ollama service.
-        "service": "openai",
-        "service_settings": {
-            "api_key": "ollama",  # Ollama doesn't require auth; ES requires a non-empty value
-            "url": f"{_OLLAMA_URL}/v1/embeddings",
-            "model_id": "nomic-embed-text",
-            "similarity": "cosine",
-        },
-    },
     "mxbai": {
         "label": "mxbai-embed-large",
         "index": "english-mxbai",
         "inference_id": "mxbai-embed-large",
         "enabled": _is_truthy(os.environ.get("MXBAI_ENABLED")),
-        "multilingual": False,  # English-only, replicates colleague's original approach
+        "multilingual": False,
         # Ollama exposes an OpenAI-compatible API — use that since ES 8.16 has no native ollama service.
         "service": "openai",
         "service_settings": {
-            "api_key": "ollama",
+            "api_key": "ollama",  # Ollama doesn't require auth; ES requires a non-empty value
             "url": f"{_OLLAMA_URL}/v1/embeddings",
             "model_id": "mxbai-embed-large",
-            "similarity": "cosine",
-        },
-    },
-    "embeddinggemma": {
-        "label": "embeddinggemma-300m",
-        "index": "english-embeddinggemma",
-        "inference_id": "embeddinggemma-300m",
-        "enabled": _is_truthy(os.environ.get("EMBEDDINGGEMMA_ENABLED")),
-        # Served locally by the tei-gemma Docker service (text-embeddings-inference).
-        "service": "hugging_face",
-        "service_settings": {
-            "api_key": "tei-local",   # TEI doesn't enforce auth; ES requires a non-empty value
-            "url": "http://tei-gemma/",
             "similarity": "cosine",
         },
     },

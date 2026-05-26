@@ -70,17 +70,6 @@ services:
       - GC_PROM_USER=${GC_PROM_USER}
       - GC_PROM_PASSWORD=${GC_PROM_PASSWORD}
       - DEPLOY_ENV=${DEPLOY_ENV:-local}
-  tei-gemma:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
-    container_name: tei-gemma
-    # Downloads google/embeddinggemma-300m on first start (~600 MB); subsequent
-    # starts are instant because the model is cached in the tei-model-cache volume.
-    command: --model-id google/embeddinggemma-300m --port 80
-    volumes:
-      - tei-model-cache:/data
-    profiles:
-      - embeddinggemma
-
 networks:
   default:
     driver: bridge
@@ -90,5 +79,4 @@ networks:
 
 volumes:
   es-logs:
-  tei-model-cache:
 
