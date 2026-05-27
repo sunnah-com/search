@@ -2,17 +2,6 @@
 
 Flask + Elasticsearch search service for sunnah.com. Supports lexical (BM25) and semantic search.
 
-## What's in this branch
-
-This branch adds **semantic search** alongside the existing lexical (BM25) search, using `mxbai-embed-large` served via Ollama.
-
-### Key changes from main
-
-- **Dedicated lexical index** (`english-lexical`) — separated from the semantic index so it can be rebuilt quickly without re-embedding.
-- **Semantic index** (`english-mxbai`) — `mxbai-embed-large` embeddings via Ollama, English corpus.
-
-Corresponding website changes (mode toggles in the production UI) are in the `semantic-search-ui-toggles` branch of the website repo.
-
 ---
 
 ## Architecture
@@ -62,7 +51,7 @@ ollama pull mxbai-embed-large
 docker compose up --build
 ```
 
-`docker-compose.override.yml` is applied automatically and exposes Flask on **port 5001**.
+Flask is exposed on **port 5001**.
 
 ### 4. Build the indexes
 
@@ -163,13 +152,13 @@ http://<server>:7650/index/status
 
 mxbai runs via **Ollama on the host machine**, not inside Docker. The container reaches it at `http://host.docker.internal:11434`. Ollama exposes an OpenAI-compatible API, which ES 8.16's inference endpoint uses to embed queries and index documents.
 
-### Adding a model in the future
+### Adding a model
 
 1. Add an entry to `EMBEDDING_MODELS` in `main.py` — copy the mxbai entry as a template (~8 lines).
 2. Add `NEWMODEL_ENABLED=false` to `.env.sample`.
 3. Pull the model: `ollama pull your-model-name`
 4. Hit `/index?password=...&model=newmodel` to build its index.
-5. Add the alias name to `SEMANTIC_INDEXES` in `batch_search.py`.
+5. Add the alias name to `SEMANTIC_INDEXES` in `tests/batch_search.py`.
 
 ---
 
@@ -202,8 +191,7 @@ Mode is passed as a query parameter:
 
 | File | When to use |
 |---|---|
-| `docker-compose.yml` | Base definition. Do not run directly. |
-| `docker-compose.override.yml` | Applied automatically on `docker compose up`. Exposes Flask on port 5001 (overrides default 5000 to avoid local conflicts). |
+| `docker-compose.yml` | Local development. `docker compose up --build`. |
 | `docker-compose.prod.yml` | Production. Run with `-f docker-compose.prod.yml`. Uses uwsgi, persistent ES data volume, explicit JVM memory limits, no MySQL service. |
 
 **Why Elasticsearch has a fixed IP** (`172.31.250.10`): at high request rates, Docker's embedded DNS resolver becomes a bottleneck and throws `EAI_AGAIN` errors. Hardcoding the IP in `/etc/hosts` via `extra_hosts` makes every lookup instant.
@@ -214,18 +202,18 @@ Mode is passed as a query parameter:
 
 ## Batch evaluation
 
-`batch_search.py` runs a fixed set of queries across lexical and semantic and produces a CSV and markdown report for side-by-side comparison.
+`tests/batch_search.py` runs a fixed set of queries across lexical and semantic and produces a CSV and markdown report for side-by-side comparison.
 
 ```bash
 # Copy script into container, run it, copy results back
-docker cp search/batch_search.py search-web-1:/code/batch_search.py && \
+docker cp tests/batch_search.py search-web-1:/code/batch_search.py && \
 docker exec search-web-1 python3 /code/batch_search.py && \
-docker cp search-web-1:/code/batch_results.csv search/batch_results.csv && \
-docker cp search-web-1:/code/batch_report.md search/batch_report.md
+docker cp search-web-1:/code/batch_results.csv tests/batch_results.csv && \
+docker cp search-web-1:/code/batch_report.md tests/batch_report.md
 ```
 
 The script runs inside the container because ES is not exposed to the host — it's only reachable at `http://elasticsearch:9200` from within the Docker network.
 
-Edit `QUERIES` in `batch_search.py` to change which queries are tested.
+Edit `QUERIES` in `tests/batch_search.py` to change which queries are tested.
 
 **Note:** always use commas between query strings in the list. Python silently concatenates adjacent string literals without a comma, producing wrong queries with no error.
