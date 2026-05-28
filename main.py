@@ -509,6 +509,9 @@ def _make_mappings(non_indexed_fields, model=None):
     }
     props["arabicText"] = {"type": "text", "analyzer": "custom_arabic"}
     props["contentHash"] = {"type": "keyword", "index": False}
+    # Reconstruction payloads: kept in _source, kept out of the index entirely.
+    props["en"] = {"type": "object", "enabled": False}
+    props["ar"] = {"type": "object", "enabled": False}
     if model:
         props[SEMANTIC_FIELD] = {
             "type": "semantic_text",
@@ -651,36 +654,73 @@ def index():
     # Filter out empty rows at the source so the rest of the pipeline doesn't
     # have to handle them — TEI rejects empty inputs, ES wastes an _id storing
     # them, and a hadith with no text can't match any query anyway.
+    #
+    # Each SELECT's columns ARE a language's reconstruction payload (`dict(r)`
+    # below) — the names match the website's EnglishHadith/ArabicHadith model
+    # properties, so keep them in sync. bookID is DECIMAL — cast to CHAR so it
+    # JSON-serializes and matches how the website keys books ("1.0").
     cursor.execute(
-        """SELECT arabicURN as urn, collection, hadithNumber, hadithText as arabicText,
-                    matchingEnglishURN, "ar" as lang, grade1 as grade FROM ArabicHadithTable
+        """SELECT arabicURN, collection, volumeNumber, bookNumber, hadithNumber,
+                    hadithText, CAST(bookID AS CHAR) AS bookID, grade1,
+                    ourHadithNumber, matchingEnglishURN
+                  FROM ArabicHadithTable
                   WHERE hadithText IS NOT NULL AND TRIM(hadithText) != ''"""
     )
-    arabicHadiths = cursor.fetchall()
+    arabicRows = cursor.fetchall()
 
-    arabicOnlyHadiths, matchingArabicHadiths = [], {}
-    for h in arabicHadiths:
-        if h["matchingEnglishURN"] == 0:
-            arabicOnlyHadiths.append(h)
+    # One doc per Arabic hadith; index the `ar` payload by matching English URN
+    # so the English pass can fold paired hadiths into one bilingual doc.
+    arabicHadiths = []
+    arabicOnlyHadiths = []
+    arabicByMatchingEnglish = {}
+    for hadith in arabicRows:
+        ar_obj = dict(hadith)
+        doc = {
+            "lang": "ar",
+            "urn": hadith["arabicURN"],
+            "collection": hadith["collection"],
+            "hadithNumber": hadith["hadithNumber"],
+            "arabicText": hadith["hadithText"],
+            "grade": hadith["grade1"],
+            "ar": ar_obj,
+        }
+        arabicHadiths.append(doc)
+        if hadith["matchingEnglishURN"] == 0:
+            arabicOnlyHadiths.append(doc)
         else:
-            matchingArabicHadiths[h["matchingEnglishURN"]] = h
+            arabicByMatchingEnglish[r["matchingEnglishURN"]] = ar_obj
 
     cursor.execute(
-        """SELECT englishURN as urn, collection, hadithText,
-                    matchingArabicURN, "en" as lang, grade1 as grade FROM EnglishHadithTable
+        """SELECT englishURN, collection, volumeNumber, bookNumber, hadithNumber,
+                    hadithText, CAST(bookID AS CHAR) AS bookID, grade1,
+                    ourHadithNumber, matchingArabicURN
+                  FROM EnglishHadithTable
                   WHERE hadithText IS NOT NULL AND TRIM(hadithText) != ''"""
     )
-    englishHadiths = cursor.fetchall()
-    for h in englishHadiths:
-        if h["urn"] in matchingArabicHadiths:
-            ar = matchingArabicHadiths[h["urn"]]
-            h["arabicText"] = ar["arabicText"]
-            h["arabicGrade"] = ar["grade"]
-            h["hadithNumber"] = ar["hadithNumber"]
+    englishRows = cursor.fetchall()
+
+    englishHadiths = []
+    for hadith in englishRows:
+        doc = {
+            "lang": "en",
+            "urn": hadith["englishURN"],
+            "collection": hadith["collection"],
+            "hadithText": hadith["hadithText"],
+            "grade": hadith["grade1"],
+            "en": dict(hadith),
+        }
+        # Fold in the matching Arabic side → one bilingual doc. Arabic
+        # hadithNumber stays top-level to preserve search ranking (hadithNumber^2).
+        ar_obj = arabicByMatchingEnglish.get(r["englishURN"])
+        if ar_obj is not None:
+            doc["arabicText"] = ar_obj["hadithText"]
+            doc["hadithNumber"] = ar_obj["hadithNumber"]
+            doc["ar"] = ar_obj
+        englishHadiths.append(doc)
 
     connection.close()
 
-    non_indexed = ["urn", "matchingArabicURN", "lang"]
+    non_indexed = ["urn", "lang"]
 
     # Prepare IDs and content hashes. arabicHadiths is a superset of arabicOnlyHadiths
     # (same dict objects), so preparing arabicHadiths covers both.
