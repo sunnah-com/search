@@ -7,6 +7,7 @@ import urllib.request
 import urllib.error
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from enum import Enum
 from flask import Flask, request, jsonify, g
 from werkzeug.exceptions import HTTPException
 import pymysql
@@ -150,9 +151,13 @@ DEFAULT_SEMANTIC_MODEL = "mxbai"
 LEXICAL_BULK_TIMEOUT_S = 60
 SEMANTIC_BULK_TIMEOUT_S = 300
 
-# Search modes. Two values, only ever compared as strings.
-LEXICAL_MODE = "lexical"
-SEMANTIC_MODE = "semantic"
+class SearchMode(str, Enum):
+    """Search mode for /search?mode=…. str mixin so equality with raw query
+    strings and JSON serialization both produce the underlying value
+    ('lexical' / 'semantic') without extra plumbing.
+    """
+    LEXICAL = "lexical"
+    SEMANTIC = "semantic"
 
 COLLECTION_BOOSTS = [
     ("bukhari", 5.0),
@@ -703,13 +708,16 @@ def get_filter_from_args(args):
 
 
 def _resolve_mode(args):
-    """Normalize ?mode=... to either LEXICAL_MODE or SEMANTIC_MODE. Falls back
-    to lexical for unknown values and whenever SEMANTIC_ENABLED is off.
+    """Normalize ?mode=... to a SearchMode. Falls back to LEXICAL for unknown
+    values and whenever SEMANTIC_ENABLED is off.
     """
-    requested = (args.get("mode") or "").lower()
-    if requested == SEMANTIC_MODE and SEMANTIC_ENABLED:
-        return SEMANTIC_MODE
-    return LEXICAL_MODE
+    try:
+        mode = SearchMode((args.get("mode") or "").lower())
+    except ValueError:
+        return SearchMode.LEXICAL
+    if mode == SearchMode.SEMANTIC and not SEMANTIC_ENABLED:
+        return SearchMode.LEXICAL
+    return mode
 
 
 def _resolve_model_key(args):
@@ -731,7 +739,7 @@ def search(language):
     filters = get_filter_from_args(request.args)
     mode = _resolve_mode(request.args)
     model_key, model = None, None
-    if mode == SEMANTIC_MODE:
+    if mode == SearchMode.SEMANTIC:
         model_key, err = _resolve_model_key(request.args)
         if err:
             return jsonify({"error": err}), 400
@@ -756,7 +764,7 @@ def search(language):
             }
         }
 
-    if mode == SEMANTIC_MODE:
+    if mode == SearchMode.SEMANTIC:
         access_log.info("semantic_search", extra={
             "request_id": getattr(g, "request_id", None),
             "mode": mode, "model": model_key, "query": query,
