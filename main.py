@@ -618,21 +618,29 @@ def index():
     # Semantic index: full multilingual corpus — every Arabic doc gets its Arabic text
     # embedded, every English doc gets its English text embedded. This lets a multilingual
     # model like text-embedding-3-small retrieve across both languages from one index.
-    results = {}
+    # Decide what to build from ?model=…:
+    #   missing       → lexical + every enabled semantic model
+    #   "lexical"     → lexical only
+    #   <model key>   → that semantic model only
+    #   anything else → 400, don't silently misinterpret
+    if target_model is None:
+        build_lexical = True
+        models_to_index = _ENABLED_MODELS
+    elif target_model == "lexical":
+        build_lexical = True
+        models_to_index = {}
+    elif target_model in _ENABLED_MODELS:
+        build_lexical = False
+        models_to_index = {target_model: _ENABLED_MODELS[target_model]}
+    else:
+        valid = ["lexical", *sorted(_ENABLED_MODELS)]
+        return jsonify({"error": f"unknown model '{target_model}'; "
+                                 f"valid: {valid}"}), 400
 
-    # Lexical index — built when no model is specified, or when model=lexical.
-    if not target_model or target_model == "lexical":
+    results = {}
+    if build_lexical:
         results["lexical"] = _index_one(LEXICAL_INDEX, lexical_docs, non_indexed,
                                          model=None, force_rebuild=force_rebuild)
-
-    # Model indexes — skip entirely when model=lexical.
-    models_to_index = (
-        {}
-        if target_model == "lexical"
-        else {target_model: _ENABLED_MODELS[target_model]}
-        if target_model and target_model in _ENABLED_MODELS
-        else _ENABLED_MODELS
-    )
     for model_key, model in models_to_index.items():
         _ensure_inference_endpoint(model)
         if model.get("multilingual"):
