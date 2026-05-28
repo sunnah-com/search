@@ -221,22 +221,15 @@ def _prepare_documents(documents):
         doc["contentHash"] = _content_hash(doc)
 
 
-# TEI (Text Embeddings Inference) tuning, all env-overridable:
-#   HF_DEDICATED_CONCURRENCY: HF's per-endpoint pool starts 429ing well below
-#     TEI's stated max_concurrent_requests=512. c=4 is empirically clean; raise
-#     when the endpoint is configured with higher autoscale.
-#   HF_DEDICATED_BATCH_SIZE: batch_size × max_input_length must stay under TEI's
-#     max_batch_tokens (default 16384). 16 × 512 = 8192 leaves headroom.
+# HF's per-endpoint pool 429s well below TEI's max_concurrent_requests=512.
+# batch_size × max_input_length must stay under TEI's max_batch_tokens (16384).
 _REMOTE_EMBED_CONCURRENCY = int(os.environ.get("HF_DEDICATED_CONCURRENCY", "4"))
 _REMOTE_EMBED_BATCH_SIZE = int(os.environ.get("HF_DEDICATED_BATCH_SIZE", "16"))
-# HF Dedicated bills by compute-time, not RPM — default no throttle. Override
-# via HF_DEDICATED_RPM (set >0) if you ever hit per-endpoint rate limits.
+# -1 disables throttling; HF Dedicated bills by compute-time, not RPM.
 _REMOTE_EMBED_RPM = int(os.environ.get("HF_DEDICATED_RPM", "-1"))
 _REMOTE_EMBED_MAX_RETRIES = 6
 _REMOTE_EMBED_BACKOFF_FLOOR_S = 5
-# Upper bound on a single retry wait, including any value the server suggests
-# via Retry-After. Without this cap a 503 with `Retry-After: 600` would stall
-# a worker for 10 minutes per attempt; 6 attempts × 10 min = 1 hour idle.
+# Cap server-supplied Retry-After so a misbehaving 503 can't park a worker.
 _REMOTE_EMBED_BACKOFF_CEILING_S = 60
 
 
