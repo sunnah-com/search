@@ -37,7 +37,7 @@ Each index name in ES is an **alias** (e.g. `english-mxbai`) pointing to a times
 cp .env.sample .env
 ```
 
-Set `MXBAI_ENABLED=true` in `.env`. `OLLAMA_URL` defaults to `http://host.docker.internal:11434`, which works on Docker Desktop (Mac/Windows) — leave it unset locally.
+For semantic search, set `MXBAI_ENABLED=true` in `.env`. `OLLAMA_URL` defaults to `http://host.docker.internal:11434`, which works on Docker Desktop (Mac/Windows) — leave it unset locally.
 
 ### 2. Pull the model
 
@@ -51,30 +51,30 @@ ollama pull mxbai-embed-large
 docker compose up --build
 ```
 
-Flask is exposed on **port 5001**.
+Flask is exposed on **port 5000**.
 
 ### 4. Build the indexes
 
 ```
-http://localhost:5001/index?password=index123
+http://localhost:5000/index?password=index123
 ```
 
 This reads all hadiths from MySQL and builds both the lexical and mxbai indexes. Embedding ~48k English hadiths takes a few minutes.
 
 To index only one at a time:
 ```
-http://localhost:5001/index?password=index123&model=mxbai
-http://localhost:5001/index?password=index123&model=lexical
+http://localhost:5000/index?password=index123&model=mxbai
+http://localhost:5000/index?password=index123&model=lexical
 ```
 
 To force a full rebuild instead of incremental:
 ```
-http://localhost:5001/index?password=index123&rebuild=true
+http://localhost:5000/index?password=index123&rebuild=true
 ```
 
 Check index status (doc counts):
 ```
-http://localhost:5001/index/status
+http://localhost:5000/index/status
 ```
 
 ---
