@@ -256,36 +256,50 @@ def _make_mappings(non_indexed_fields, model=None):
 
 
 def _rebuild_index(index_name, documents, non_indexed_fields, model=None):
-    new_index = f"{index_name}-{int(time.time())}"
+    # time_ns avoids collisions when two rebuilds land in the same second.
+    new_index = f"{index_name}-{time.time_ns()}"
     timeout = BULK_REQUEST_TIMEOUT if model else 60
     es_client.indices.create(
         index=new_index,
         mappings=_make_mappings(non_indexed_fields, model),
         settings=_make_settings(),
     )
-    success, errors = _bulk_index(documents, new_index, timeout=timeout)
-    if success == 0:
+    try:
+        success, errors = _bulk_index(documents, new_index, timeout=timeout)
+        if success == 0:
+            es_client.indices.delete(index=new_index, ignore_unavailable=True)
+            return {"mode": "rebuild", "success_count": 0, "errors": errors}
+
+        old_indices = []
+        if es_client.indices.exists_alias(name=index_name):
+            old_indices = list(es_client.indices.get_alias(name=index_name).keys())
+        elif es_client.indices.exists(index=index_name):
+            es_client.indices.delete(index=index_name)
+
+        actions = [{"add": {"index": new_index, "alias": index_name}}]
+        for old in old_indices:
+            actions.append({"remove": {"index": old, "alias": index_name}})
+        es_client.indices.update_aliases(actions=actions)
+        for old in old_indices:
+            es_client.indices.delete(index=old, ignore_unavailable=True)
+    except Exception:
         es_client.indices.delete(index=new_index, ignore_unavailable=True)
-        return {"mode": "rebuild", "success_count": 0, "errors": errors}
-
-    old_indices = []
-    if es_client.indices.exists_alias(name=index_name):
-        old_indices = list(es_client.indices.get_alias(name=index_name).keys())
-    elif es_client.indices.exists(index=index_name):
-        es_client.indices.delete(index=index_name)
-
-    actions = [{"add": {"index": new_index, "alias": index_name}}]
-    for old in old_indices:
-        actions.append({"remove": {"index": old, "alias": index_name}})
-    es_client.indices.update_aliases(actions=actions)
-    for old in old_indices:
-        es_client.indices.delete(index=old, ignore_unavailable=True)
+        raise
 
     return {"mode": "rebuild", "success_count": success, "errors": errors}
 
 
 def _incremental_index(index_name, documents, model=None):
     incoming = {doc["_id"]: doc for doc in documents}
+    if not incoming:
+        # Refuse to wipe the live index when the source returns nothing
+        # (transient DB failure, wrong DATABASE env, etc.).
+        return {
+            "mode": "incremental",
+            "indexed": 0, "deleted": 0, "unchanged": 0,
+            "success_count": 0,
+            "errors": ["source returned 0 documents — refusing to delete live index"],
+        }
     existing_hashes = {}
     for hit in helpers.scan(
         es_client, index=index_name, query={"_source": ["contentHash"]}, size=2000
@@ -474,10 +488,13 @@ def _resolve_mode(args):
 
 
 def _resolve_model_key(args):
+    """Returns (key, error_message). error_message is non-None for explicit invalid input."""
     key = args.get("model")
+    if not key:
+        return next(iter(_ENABLED_MODELS), None), None
     if key in _ENABLED_MODELS:
-        return key
-    return next(iter(_ENABLED_MODELS), None)
+        return key, None
+    return None, f"unknown model '{key}'; enabled: {sorted(_ENABLED_MODELS)}"
 
 
 def malformed_query_response(exc):
@@ -490,8 +507,12 @@ def search(language):
     query = request.args.get("q")
     filters = get_filter_from_args(request.args)
     mode = _resolve_mode(request.args)
-    model_key = _resolve_model_key(request.args) if mode in SEMANTIC_MODES else None
-    model = _ENABLED_MODELS.get(model_key) if model_key else None
+    model_key, model = None, None
+    if mode in SEMANTIC_MODES:
+        model_key, err = _resolve_model_key(request.args)
+        if err:
+            return jsonify({"error": err}), 400
+        model = _ENABLED_MODELS.get(model_key) if model_key else None
     search_index = model["index"] if model else LEXICAL_INDEX
 
     fields = ["hadithNumber^2", "hadithText", "arabicText", "collection^2"]
