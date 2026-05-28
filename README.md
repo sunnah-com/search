@@ -156,11 +156,13 @@ Per-run tuning via env vars: `HF_DEDICATED_CONCURRENCY` (default 4), `HF_DEDICAT
 
 ### Adding a model
 
-1. Add an entry to `EMBEDDING_MODELS` in `main.py` — copy the mxbai entry as a template (~8 lines).
-2. Add `NEWMODEL_ENABLED=false` to `.env.sample`.
-3. Pull the model: `ollama pull your-model-name`
-4. Hit `/index?password=...&model=newmodel` to build its index.
-5. Add the alias name to `SEMANTIC_INDEXES` in `tests/batch_search.py`.
+1. Add an entry to `EMBEDDING_MODELS` in `main.py` — copy the mxbai entry as a template (~10 lines).
+2. Pull the model on the Ollama host: `ollama pull your-model-name`.
+3. Hit `/index?password=...&targets=newkey` to build its index. (`/index` with no `targets=` will pick it up too, alongside lexical and the other semantic models.)
+4. Add the alias name to `SEMANTIC_INDEXES` in `tests/batch_search.py`.
+5. If it should be the default for `/search?mode=semantic` without a `&model=` param, point `DEFAULT_SEMANTIC_MODEL` at the new key.
+
+`SEMANTIC_ENABLED` is a single global toggle — you don't add a per-model env var.
 
 ---
 
@@ -209,12 +211,10 @@ Mode is passed as a query parameter:
 `tests/batch_search.py` runs a fixed set of queries across lexical and semantic and produces a CSV and markdown report for side-by-side comparison.
 
 ```bash
-# Copy script into container, run it, copy results back
-docker cp tests/batch_search.py search-web-1:/code/batch_search.py && \
-docker exec search-web-1 python3 /code/batch_search.py && \
-docker cp search-web-1:/code/batch_results.csv tests/batch_results.csv && \
-docker cp search-web-1:/code/batch_report.md tests/batch_report.md
+docker exec search-web-1 python3 /code/tests/batch_search.py
 ```
+
+Outputs (`batch_results.csv`, `batch_report.md`) land in the repo root — the dev compose mounts `./:/code`, so files the script writes to `/code/` inside the container show up on the host immediately. No `docker cp` needed.
 
 The script runs inside the container because ES is not exposed to the host — it's only reachable at `http://elasticsearch:9200` from within the Docker network.
 
