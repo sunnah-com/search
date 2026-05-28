@@ -23,8 +23,9 @@ class RateLimiter:
     def __init__(self, rpm, log=None):
         self.enabled = rpm > 0
         if rpm == 0 and log is not None:
-            log.warning("rate_limiter_rpm_zero",
-                        extra={"hint": "use -1 to disable throttling"})
+            log.warning(
+                "rate_limiter_rpm_zero", extra={"hint": "use -1 to disable throttling"}
+            )
         self.interval = 60.0 / rpm if self.enabled else 0.0
         self.lock = threading.Lock()
         self.next_allowed = 0.0

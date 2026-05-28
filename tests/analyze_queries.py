@@ -9,6 +9,7 @@ English, Arabic, and any other script). Single-word queries are excluded.
 Run from the repo root:
     python3 search/analyze_queries.py
 """
+
 import re
 import sys
 from collections import Counter
@@ -22,15 +23,18 @@ ROW_RE = re.compile(
     r"^\(\d+,'(.*?)','(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})','[^']+',(\d+)\),?$"
 )
 
+
 def normalize(q):
     return q.replace("''", "'").strip().lower()
+
 
 def is_multiword(q):
     return len(q.split()) >= 2
 
-all_queries   = Counter()
-zero_result   = Counter()
-total_rows    = 0
+
+all_queries = Counter()
+zero_result = Counter()
+total_rows = 0
 skipped_parse = 0
 
 print(f"Streaming {SQL_PATH} …", flush=True)
@@ -44,7 +48,7 @@ with open(SQL_PATH, encoding="utf-8", errors="replace") as fh:
             skipped_parse += 1
             continue
 
-        query      = normalize(m.group(1))
+        query = normalize(m.group(1))
         num_results = int(m.group(3))
         total_rows += 1
 
@@ -62,6 +66,7 @@ print(f"\nDone. {total_rows:,} total rows | {skipped_parse:,} unparseable lines\
 print(f"Unique multi-word queries:              {len(all_queries):,}")
 print(f"Unique multi-word zero-result queries:  {len(zero_result):,}")
 
+
 def write_report(path, title, counter):
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"# {title}\n\n")
@@ -71,6 +76,7 @@ def write_report(path, title, counter):
             escaped = query.replace("|", "\\|")
             f.write(f"| {rank} | {count:,} | {escaped} |\n")
     print(f"Written: {path}")
+
 
 write_report(
     "search/test results & reports/top100_multiword_queries.md",

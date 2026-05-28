@@ -87,7 +87,9 @@ SEMANTIC_FIELD = "semantic_text"
 
 _OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://host.docker.internal:11434")
 _HUGGING_FACE_KEY = os.environ.get("HUGGING_FACE_KEY")
-_HF_DEDICATED_URL = os.environ.get("HF_DEDICATED_URL")  # e.g. https://<id>.endpoints.huggingface.cloud
+_HF_DEDICATED_URL = os.environ.get(
+    "HF_DEDICATED_URL"
+)  # e.g. https://<id>.endpoints.huggingface.cloud
 
 # Embedding vector dimensions for mxbai-embed-large(-v1). Used for inline chunks.
 _MXBAI_DIMS = 1024
@@ -151,13 +153,16 @@ DEFAULT_SEMANTIC_MODEL = "mxbai"
 LEXICAL_BULK_TIMEOUT_S = 60
 SEMANTIC_BULK_TIMEOUT_S = 300
 
+
 class SearchMode(str, Enum):
     """Search mode for /search?mode=…. str mixin so equality with raw query
     strings and JSON serialization both produce the underlying value
     ('lexical' / 'semantic') without extra plumbing.
     """
+
     LEXICAL = "lexical"
     SEMANTIC = "semantic"
+
 
 COLLECTION_BOOSTS = [
     ("bukhari", 5.0),
@@ -181,7 +186,10 @@ def _handle_unexpected(exc):
         return exc
     access_log.exception(
         "unhandled_exception",
-        extra={"request_id": getattr(g, "request_id", None), "exception": type(exc).__name__},
+        extra={
+            "request_id": getattr(g, "request_id", None),
+            "exception": type(exc).__name__,
+        },
     )
     return jsonify({"error": "internal server error"}), 500
 
@@ -193,9 +201,12 @@ def home():
 
 # ── Index management ──────────────────────────────────────────────────────────
 
+
 def _ensure_inference_endpoint(model):
     try:
-        es_client.inference.get(task_type="text_embedding", inference_id=model["inference_id"])
+        es_client.inference.get(
+            task_type="text_embedding", inference_id=model["inference_id"]
+        )
         return
     except NotFoundError:
         pass
@@ -210,7 +221,9 @@ def _ensure_inference_endpoint(model):
 
 
 def _content_hash(doc):
-    payload = {k: v for k, v in doc.items() if k not in ("_id", "contentHash", SEMANTIC_FIELD)}
+    payload = {
+        k: v for k, v in doc.items() if k not in ("_id", "contentHash", SEMANTIC_FIELD)
+    }
     encoded = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -251,11 +264,14 @@ def _embed_via_remote(model, texts):
     def _embed_batch(batch_texts):
         # OpenAI-shape body; TEI accepts the `truncate` field on /v1/embeddings
         # to silently handle inputs over max_input_length.
-        payload = json.dumps({"model": cfg["model_id"], "input": batch_texts,
-                              "truncate": True}).encode("utf-8")
+        payload = json.dumps(
+            {"model": cfg["model_id"], "input": batch_texts, "truncate": True}
+        ).encode("utf-8")
         for attempt in range(_REMOTE_EMBED_MAX_RETRIES):
             limiter.acquire()
-            req = urllib.request.Request(cfg["url"], data=payload, headers=headers, method="POST")
+            req = urllib.request.Request(
+                cfg["url"], data=payload, headers=headers, method="POST"
+            )
 
             status = None
             retry_after = None
@@ -274,8 +290,11 @@ def _embed_via_remote(model, texts):
                     body_snippet = e.read()[:400].decode("utf-8", errors="replace")
                     access_log.error(
                         "remote_embed_failed",
-                        extra={"status": e.code, "body": body_snippet,
-                               "batch_size": len(batch_texts)},
+                        extra={
+                            "status": e.code,
+                            "body": body_snippet,
+                            "batch_size": len(batch_texts),
+                        },
                     )
                     raise
             except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
@@ -285,27 +304,38 @@ def _embed_via_remote(model, texts):
                 if attempt == _REMOTE_EMBED_MAX_RETRIES - 1:
                     access_log.error(
                         "remote_embed_failed",
-                        extra={"status": status, "reason": str(e),
-                               "batch_size": len(batch_texts)},
+                        extra={
+                            "status": status,
+                            "reason": str(e),
+                            "batch_size": len(batch_texts),
+                        },
                     )
                     raise
 
             # Shared backoff path for any retryable failure above.
-            parsed = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else 0
+            parsed = (
+                float(retry_after)
+                if retry_after and retry_after.replace(".", "", 1).isdigit()
+                else 0
+            )
             # TEI sometimes returns Retry-After: 0 — enforce a floor so we don't
             # immediately re-fire. Cap Retry-After so a single misbehaving 503
             # can't park a worker for many minutes.
-            wait = max(min(parsed, _REMOTE_EMBED_BACKOFF_CEILING_S),
-                       _REMOTE_EMBED_BACKOFF_FLOOR_S,
-                       min(2 ** attempt, 30))
+            wait = max(
+                min(parsed, _REMOTE_EMBED_BACKOFF_CEILING_S),
+                _REMOTE_EMBED_BACKOFF_FLOOR_S,
+                min(2**attempt, 30),
+            )
             access_log.warning(
                 "remote_embed_retry",
                 extra={"status": status, "attempt": attempt + 1, "wait_s": wait},
             )
             time.sleep(wait)
 
-    batches = [texts[i:i + _REMOTE_EMBED_BATCH_SIZE]
-               for i in range(0, len(texts), _REMOTE_EMBED_BATCH_SIZE)]
+    batches = [
+        texts[i : i + _REMOTE_EMBED_BATCH_SIZE]
+        for i in range(0, len(texts), _REMOTE_EMBED_BATCH_SIZE)
+    ]
     out = [None] * len(batches)
     with ThreadPoolExecutor(max_workers=_REMOTE_EMBED_CONCURRENCY) as ex:
         future_to_idx = {ex.submit(_embed_batch, b): i for i, b in enumerate(batches)}
@@ -356,17 +386,23 @@ def _rewrite_inline_chunks(docs, model):
 
     access_log.info(
         "remote_embed_start",
-        extra={"model": model["label"], "doc_count": len(texts),
-               "batch_size": _REMOTE_EMBED_BATCH_SIZE,
-               "concurrency": _REMOTE_EMBED_CONCURRENCY,
-               "rpm": _REMOTE_EMBED_RPM},
+        extra={
+            "model": model["label"],
+            "doc_count": len(texts),
+            "batch_size": _REMOTE_EMBED_BATCH_SIZE,
+            "concurrency": _REMOTE_EMBED_CONCURRENCY,
+            "rpm": _REMOTE_EMBED_RPM,
+        },
     )
     t0 = time.time()
     vectors = _embed_via_remote(model, texts)
     access_log.info(
         "remote_embed_done",
-        extra={"model": model["label"], "doc_count": len(texts),
-               "duration_s": round(time.time() - t0, 1)},
+        extra={
+            "model": model["label"],
+            "doc_count": len(texts),
+            "duration_s": round(time.time() - t0, 1),
+        },
     )
 
     model_settings = {
@@ -375,8 +411,10 @@ def _rewrite_inline_chunks(docs, model):
         "similarity": "cosine",
         "element_type": "float",
     }
-    return [_inline_chunk_doc(doc, text, vec, model["inference_id"], model_settings)
-            for doc, text, vec in zip(docs, texts, vectors)]
+    return [
+        _inline_chunk_doc(doc, text, vec, model["inference_id"], model_settings)
+        for doc, text, vec in zip(docs, texts, vectors)
+    ]
 
 
 def _bulk_index(actions, index, timeout):
@@ -426,7 +464,13 @@ def _make_settings():
                     "custom_arabic": {
                         "tokenizer": "standard",
                         "char_filter": ["html_strip", "shortcode_strip"],
-                        "filter": ["lowercase", "decimal_digit", "arabic_normalization", "arabic_stemmer", "shingle"],
+                        "filter": [
+                            "lowercase",
+                            "decimal_digit",
+                            "arabic_normalization",
+                            "arabic_stemmer",
+                            "shingle",
+                        ],
                     },
                 },
                 "char_filter": {
@@ -437,8 +481,17 @@ def _make_settings():
                     }
                 },
                 "filter": {
-                    "shingle": {"type": "shingle", "min_shingle_size": 2, "max_shingle_size": 3, "output_unigrams": True},
-                    "synonyms_filter": {"type": "synonym", "lenient": True, "synonyms_path": "synonyms.txt"},
+                    "shingle": {
+                        "type": "shingle",
+                        "min_shingle_size": 2,
+                        "max_shingle_size": 3,
+                        "output_unigrams": True,
+                    },
+                    "synonyms_filter": {
+                        "type": "synonym",
+                        "lenient": True,
+                        "synonyms_path": "synonyms.txt",
+                    },
                     "arabic_stemmer": {"type": "stemmer", "language": "arabic"},
                     "arabic_stop": {"type": "stop", "stopwords": "_arabic_"},
                 },
@@ -507,7 +560,9 @@ def _incremental_index(index_name, documents, model=None):
         # (transient DB failure, wrong DATABASE env, etc.).
         return {
             "mode": "incremental",
-            "indexed": 0, "deleted": 0, "unchanged": 0,
+            "indexed": 0,
+            "deleted": 0,
+            "unchanged": 0,
             "success_count": 0,
             "errors": ["source returned 0 documents — refusing to delete live index"],
         }
@@ -517,8 +572,11 @@ def _incremental_index(index_name, documents, model=None):
     ):
         existing_hashes[hit["_id"]] = hit["_source"].get("contentHash")
 
-    to_index = [doc for doc_id, doc in incoming.items()
-                if existing_hashes.get(doc_id) != doc["contentHash"]]
+    to_index = [
+        doc
+        for doc_id, doc in incoming.items()
+        if existing_hashes.get(doc_id) != doc["contentHash"]
+    ]
     to_delete = [doc_id for doc_id in existing_hashes if doc_id not in incoming]
 
     if to_index and model and model.get("remote_inference"):
@@ -541,7 +599,9 @@ def _incremental_index(index_name, documents, model=None):
     }
 
 
-def _index_one(index_name, documents, non_indexed_fields, model=None, force_rebuild=False):
+def _index_one(
+    index_name, documents, non_indexed_fields, model=None, force_rebuild=False
+):
     """Rebuild or incrementally update a single index."""
     if force_rebuild or not _index_is_incremental(index_name):
         return _rebuild_index(index_name, documents, non_indexed_fields, model)
@@ -549,6 +609,7 @@ def _index_one(index_name, documents, non_indexed_fields, model=None, force_rebu
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+
 
 @app.route("/index", methods=["GET"])
 def index():
@@ -568,11 +629,17 @@ def index():
     else:
         targets = {t.strip() for t in raw_targets.split(",") if t.strip()}
         if not targets:
-            return jsonify({"error": "targets= must be a non-empty comma-separated list"}), 400
+            return jsonify(
+                {"error": "targets= must be a non-empty comma-separated list"}
+            ), 400
         unknown = targets - valid_targets
         if unknown:
-            return jsonify({"error": f"unknown targets {sorted(unknown)}; "
-                                     f"valid: {sorted(valid_targets)}"}), 400
+            return jsonify(
+                {
+                    "error": f"unknown targets {sorted(unknown)}; "
+                    f"valid: {sorted(valid_targets)}"
+                }
+            ), 400
 
     connection = pymysql.connect(
         host=os.environ.get("MYSQL_HOST"),
@@ -628,8 +695,13 @@ def index():
     # model like text-embedding-3-small retrieve across both languages from one index.
     results = {}
     if "lexical" in targets:
-        results["lexical"] = _index_one(LEXICAL_INDEX, lexical_docs, non_indexed,
-                                         model=None, force_rebuild=force_rebuild)
+        results["lexical"] = _index_one(
+            LEXICAL_INDEX,
+            lexical_docs,
+            non_indexed,
+            model=None,
+            force_rebuild=force_rebuild,
+        )
     models_to_index = {k: v for k, v in _ENABLED_MODELS.items() if k in targets}
     for model_key, model in models_to_index.items():
         _ensure_inference_endpoint(model)
@@ -644,7 +716,11 @@ def index():
 
         model_docs = _attach_semantic_field(paired)
         results[model_key] = _index_one(
-            model["index"], model_docs, non_indexed, model=model, force_rebuild=force_rebuild
+            model["index"],
+            model_docs,
+            non_indexed,
+            model=model,
+            force_rebuild=force_rebuild,
         )
         results[model_key]["failed"] = json.dumps(results[model_key].pop("errors"))
 
@@ -670,12 +746,18 @@ def index_status():
 
 # ── Search helpers ────────────────────────────────────────────────────────────
 
+
 def get_suggest_query(field):
     return {
-        "field": field, "size": 3, "gram_size": 3,
+        "field": field,
+        "size": 3,
+        "gram_size": 3,
         "direct_generator": [{"field": field, "suggest_mode": "missing"}],
         "highlight": {"pre_tag": "<em>", "post_tag": "</em>"},
-        "collate": {"query": {"source": {"match": {field: "{{suggestion}}"}}}, "prune": False},
+        "collate": {
+            "query": {"source": {"match": {field: "{{suggestion}}"}}},
+            "prune": False,
+        },
     }
 
 
@@ -727,7 +809,10 @@ def _resolve_model_key(args):
 
 
 def malformed_query_response(exc):
-    access_log.warning("malformed_query", extra={"request_id": getattr(g, "request_id", None), "detail": str(exc)})
+    access_log.warning(
+        "malformed_query",
+        extra={"request_id": getattr(g, "request_id", None), "detail": str(exc)},
+    )
     return jsonify({"error": "malformed query"}), 400
 
 
@@ -742,10 +827,15 @@ def search(language):
         if err:
             return jsonify({"error": err}), 400
         model = _ENABLED_MODELS[model_key]
-        access_log.info("semantic_search", extra={
-            "request_id": getattr(g, "request_id", None),
-            "mode": mode, "model": model_key, "query": query,
-        })
+        access_log.info(
+            "semantic_search",
+            extra={
+                "request_id": getattr(g, "request_id", None),
+                "mode": mode,
+                "model": model_key,
+                "query": query,
+            },
+        )
         return _semantic_search(model["index"], query, filters)
 
     # Lexical path
@@ -779,7 +869,9 @@ def search(language):
         try:
             result = es_client.search(query=build_lexical("query_string"), **kwargs)
         except BadRequestError:
-            result = es_client.search(query=build_lexical("simple_query_string"), **kwargs)
+            result = es_client.search(
+                query=build_lexical("simple_query_string"), **kwargs
+            )
     except BadRequestError as e:
         return malformed_query_response(e)
     return jsonify(result.body)

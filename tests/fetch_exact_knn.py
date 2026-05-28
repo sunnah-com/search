@@ -4,6 +4,7 @@ Fetch exact kNN results for all 4 models by:
 2. Running knn query on inner dense_vector field (semantic_text.inference.chunks.embeddings)
    with num_candidates >= index doc count (forces exhaustive search)
 """
+
 import urllib.request, urllib.parse, json, sys
 from base64 import b64decode
 
@@ -41,6 +42,7 @@ MODELS = {
 
 import base64, urllib.error
 
+
 def es_request(path, method="GET", body=None):
     url = ES + path
     data = json.dumps(body).encode() if body else None
@@ -52,9 +54,13 @@ def es_request(path, method="GET", body=None):
     resp = urllib.request.urlopen(req, timeout=60)
     return json.loads(resp.read())
 
+
 def get_embedding(inference_id, text):
-    r = es_request(f"/_inference/text_embedding/{inference_id}", "POST", {"input": text})
+    r = es_request(
+        f"/_inference/text_embedding/{inference_id}", "POST", {"input": text}
+    )
     return r["text_embedding"][0]["embedding"]
+
 
 results = {}
 for model_key, cfg in MODELS.items():
@@ -65,7 +71,10 @@ for model_key, cfg in MODELS.items():
 
     # Exact kNN: num_candidates >= num_docs forces exhaustive search
     num_candidates = cfg["num_docs"] + 1000
-    print(f"  Running knn on {cfg['index']} (num_candidates={num_candidates}) ...", file=sys.stderr)
+    print(
+        f"  Running knn on {cfg['index']} (num_candidates={num_candidates}) ...",
+        file=sys.stderr,
+    )
 
     body = {
         "size": K,
@@ -74,7 +83,7 @@ for model_key, cfg in MODELS.items():
             "query_vector": emb,
             "k": K,
             "num_candidates": num_candidates,
-            "inner_hits": {"size": 1, "_source": False, "fields": []}
+            "inner_hits": {"size": 1, "_source": False, "fields": []},
         },
         "_source": ["urn", "hadithText", "collection"],
     }
@@ -85,10 +94,10 @@ for model_key, cfg in MODELS.items():
         print(f"  Got {len(hits)} hits", file=sys.stderr)
         results[model_key] = [
             {
-                "rank": i+1,
+                "rank": i + 1,
                 "urn": h.get("_source", {}).get("urn", h.get("_id", "")),
                 "score": round(h.get("_score", 0), 4),
-                "text": h.get("_source", {}).get("hadithText", "")
+                "text": h.get("_source", {}).get("hadithText", ""),
             }
             for i, h in enumerate(hits)
         ]

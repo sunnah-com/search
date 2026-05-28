@@ -221,3 +221,9 @@ The script runs inside the container because ES is not exposed to the host — i
 Edit `QUERIES` in `tests/batch_search.py` to change which queries are tested.
 
 **Note:** always use commas between query strings in the list. Python silently concatenates adjacent string literals without a comma, producing wrong queries with no error.
+
+---
+
+## Formatting
+
+Format Python code with `uv format` before committing.

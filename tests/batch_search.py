@@ -29,6 +29,7 @@ To change how many are shown in the markdown report: edit REPORT_TOP_N.
 NOTE: always include commas between query strings — Python silently concatenates
 adjacent string literals without a comma, producing wrong queries with no error.
 """
+
 import csv
 import os
 import re
@@ -45,16 +46,25 @@ LEXICAL_INDEX = "english-lexical"
 LEXICAL_FIELDS = ["hadithNumber^2", "hadithText", "arabicText", "collection^2"]
 
 COLLECTION_BOOSTS = [
-    ("bukhari", 5.0), ("muslim", 4.8), ("nasai", 3.5), ("abudawud", 3.0),
-    ("tirmidhi", 2.5), ("ibnmajah", 2.0), ("malik", 2.5), ("ahmad", 2.5),
-    ("darimi", 2.0), ("mishkat", 2.5), ("nawawi40", 3.3), ("riyadussalihin", 2.5),
+    ("bukhari", 5.0),
+    ("muslim", 4.8),
+    ("nasai", 3.5),
+    ("abudawud", 3.0),
+    ("tirmidhi", 2.5),
+    ("ibnmajah", 2.0),
+    ("malik", 2.5),
+    ("ahmad", 2.5),
+    ("darimi", 2.0),
+    ("mishkat", 2.5),
+    ("nawawi40", 3.3),
+    ("riyadussalihin", 2.5),
 ]
 
 SEMANTIC_INDEXES = {
-    "openai-small-en":    "english-openai-small-1779045411",
-    #"openai-small-multi": "multilingual-openai-small-1779017104",
-    "nomic":              "english-nomic-1779026769",
-    "mxbai":              "english-mxbai-1779026713",
+    "openai-small-en": "english-openai-small-1779045411",
+    # "openai-small-multi": "multilingual-openai-small-1779017104",
+    "nomic": "english-nomic-1779026769",
+    "mxbai": "english-mxbai-1779026713",
 }
 
 QUERIES = [
@@ -70,15 +80,15 @@ QUERIES = [
     "racism",
     "polygamy",
     "pork",
-    "dance"
-,]
+    "dance",
+]
 
-SIZE = 100   # fetch this many; report shows top 10 per model per query
+SIZE = 100  # fetch this many; report shows top 10 per model per query
 REPORT_TOP_N = 10
 
 OUT_DIR = "/code"
 CSV_PATH = os.path.join(OUT_DIR, "batch_results.csv")
-MD_PATH  = os.path.join(OUT_DIR, "batch_report.md")
+MD_PATH = os.path.join(OUT_DIR, "batch_report.md")
 
 
 def lexical_search(query, size=SIZE):
@@ -125,15 +135,17 @@ def semantic_search(index, query, size=SIZE):
 def query_anchor(query):
     s = f'query: "{query}"'
     s = s.lower()
-    s = re.sub(r'[^\w\s-]', '', s)
-    s = re.sub(r'\s+', '-', s.strip())
+    s = re.sub(r"[^\w\s-]", "", s)
+    s = re.sub(r"\s+", "-", s.strip())
     return s
 
 
 def snippet(text, width=160):
     if not text:
         return ""
-    return textwrap.shorten(text.replace("\n", " ").strip(), width=width, placeholder="…")
+    return textwrap.shorten(
+        text.replace("\n", " ").strip(), width=width, placeholder="…"
+    )
 
 
 def run():
@@ -145,8 +157,12 @@ def run():
     md_sections.append(f"# Batch Search Report")
     md_sections.append(f"**Date:** {date.today()}  ")
     md_sections.append(f"**Models:** {', '.join(all_models)}  ")
-    md_sections.append(f"**Method:** lexical = BM25 + collection boosts; semantic = HNSW `size={SIZE}`  ")
-    md_sections.append(f"**Queries:** {len(QUERIES)}, report shows top {REPORT_TOP_N} per model")
+    md_sections.append(
+        f"**Method:** lexical = BM25 + collection boosts; semantic = HNSW `size={SIZE}`  "
+    )
+    md_sections.append(
+        f"**Queries:** {len(QUERIES)}, report shows top {REPORT_TOP_N} per model"
+    )
     md_sections.append("")
 
     # Table of contents
@@ -157,7 +173,7 @@ def run():
 
     for query in QUERIES:
         print(f"\nQuery: {query!r}")
-        md_sections.append(f"---\n\n## Query: \"{query}\"\n")
+        md_sections.append(f'---\n\n## Query: "{query}"\n')
 
         for model_name, index in all_models.items():
             print(f"  [{model_name}] ...", end=" ", flush=True)
@@ -182,24 +198,37 @@ def run():
                 text = src.get("hadithText", "")
                 urn = src.get("urn", "")
 
-                csv_rows.append({
-                    "query":        query,
-                    "model":        model_name,
-                    "rank":         rank,
-                    "collection":   collection,
-                    "hadithNumber": hadith_num,
-                    "urn":          urn,
-                    "score":        score,
-                    "text_snippet": snippet(text, width=500),
-                })
+                csv_rows.append(
+                    {
+                        "query": query,
+                        "model": model_name,
+                        "rank": rank,
+                        "collection": collection,
+                        "hadithNumber": hadith_num,
+                        "urn": urn,
+                        "score": score,
+                        "text_snippet": snippet(text, width=500),
+                    }
+                )
 
-                md_sections.append(f"**#{rank}** — {collection} {hadith_num} · score: {score}")
+                md_sections.append(
+                    f"**#{rank}** — {collection} {hadith_num} · score: {score}"
+                )
                 md_sections.append(f"> {snippet(text, width=600)}\n")
 
             md_sections.append("")
 
     # Write CSV
-    fieldnames = ["query", "model", "rank", "collection", "hadithNumber", "urn", "score", "text_snippet"]
+    fieldnames = [
+        "query",
+        "model",
+        "rank",
+        "collection",
+        "hadithNumber",
+        "urn",
+        "score",
+        "text_snippet",
+    ]
     with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -210,7 +239,9 @@ def run():
     with open(MD_PATH, "w", encoding="utf-8") as f:
         f.write("\n".join(md_sections) + "\n")
     print(f"MD   → {MD_PATH}")
-    print(f"Rows: {len(csv_rows)} ({len(QUERIES)} queries × {len(all_models)} models × up to {REPORT_TOP_N})")
+    print(
+        f"Rows: {len(csv_rows)} ({len(QUERIES)} queries × {len(all_models)} models × up to {REPORT_TOP_N})"
+    )
 
 
 if __name__ == "__main__":
