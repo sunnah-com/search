@@ -40,6 +40,12 @@ services:
       - es-logs:/usr/share/elasticsearch/logs
     env_file:
       - .env
+    # ES itself calls Ollama on the host for query/index-time embedding via its
+    # OpenAI-compatible inference endpoint, so it also needs host.docker.internal
+    # to resolve on Linux (host-gateway = the host's IP on the bridge network).
+    # Without this, registering the inference endpoint fails with "Invalid host".
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       default:
         ipv4_address: 172.31.250.10
@@ -86,4 +92,3 @@ networks:
 volumes:
   es-logs:
   es-data:
-

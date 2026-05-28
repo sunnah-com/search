@@ -20,6 +20,7 @@ from pythonjsonlogger import jsonlogger
 
 from utils.rate_limiter import RateLimiter
 from utils.shortcode_pattern import SHORTCODE_PATTERN
+from utils.vector_checkpoint import VectorCheckpoint, NullCheckpoint
 
 load_dotenv(".env.local")
 
@@ -245,28 +246,152 @@ _REMOTE_EMBED_BACKOFF_FLOOR_S = 5
 # Cap server-supplied Retry-After so a misbehaving 503 can't park a worker.
 _REMOTE_EMBED_BACKOFF_CEILING_S = 60
 
+# HF Dedicated Endpoints scale-to-zero and pass through a transitional state
+# while spinning up: 503 (cold start) then 400 {"error":"Bad Request: workload
+# is not stopped"} (endpoint mid-deploy, not actually ready). Both are endpoint
+# lifecycle states, not real request errors, so we treat them as retryable and
+# wait for a successful probe before fanning batches out at a cold endpoint.
+_HF_TRANSITIONAL_BODY = "workload is not stopped"
+# Cold-start budget: wait up to 10 min for the endpoint to warm up, re-probing
+# every 10s, before fanning embed batches out at it.
+_REMOTE_READY_TIMEOUT_S = 600
+_REMOTE_READY_POLL_S = 10
 
-def _embed_via_remote(model, texts):
-    """Batch-embed `texts` via the configured HF Dedicated Endpoint.
+# Disk-backed vector cache: persists embedded batches so an interrupted build
+# resumes instead of re-embedding the whole corpus. Defaults on; lives under the
+# app working tree (per-container in prod) and is deleted on a successful build.
+_EMBED_CHECKPOINT_ENABLED = _is_truthy(
+    os.environ.get("EMBED_CHECKPOINT_ENABLED", "true")
+)
+_EMBED_CHECKPOINT_DIR = "data/embed_checkpoints"
 
-    Returns a list of float vectors aligned with input order. Retries on 429
-    and transient 5xx with exponential backoff (Retry-After respected when
-    ≥ floor). Captures the response body on non-retryable failures (e.g. 400
-    "inputs cannot be empty") to make debugging easier.
-    """
-    cfg = model["remote_inference"]
-    headers = {
+
+def _embed_text_key(text):
+    """Cache key for an embedding: a hash of the exact text sent to the model."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _remote_headers(cfg):
+    """Auth + content-type headers for the OpenAI-compatible HF embed endpoint."""
+    return {
         "Authorization": f"Bearer {cfg['api_key']}",
         "Content-Type": "application/json",
     }
+
+
+def _remote_payload(cfg, inputs):
+    """OpenAI-shape embed body. TEI accepts `truncate` to silently handle inputs
+    over max_input_length, so we never have to pre-trim."""
+    return json.dumps(
+        {"model": cfg["model_id"], "input": inputs, "truncate": True}
+    ).encode("utf-8")
+
+
+def _open_checkpoint(model):
+    """Resume cache for this model — a no-op NullCheckpoint when disabled, not a
+    semantic model, or unwritable.
+
+    Returning a uniform object (never None) lets callers use it with no guards,
+    and degrades gracefully: a checkpoint that can't be created (e.g. read-only
+    filesystem) must never block an index build.
+    """
+    if not (_EMBED_CHECKPOINT_ENABLED and model and model.get("remote_inference")):
+        return NullCheckpoint()
+    path = os.path.join(_EMBED_CHECKPOINT_DIR, f"{model['index']}.jsonl")
+    try:
+        cp = VectorCheckpoint(path)
+    except OSError as e:
+        access_log.warning(
+            "embed_checkpoint_unavailable", extra={"path": path, "reason": str(e)}
+        )
+        return NullCheckpoint()
+    access_log.info("embed_checkpoint_open", extra={"path": path, "cached": len(cp)})
+    return cp
+
+
+def _remote_failure_retryable(status_code, body):
+    """Classify an HTTP failure from the remote embed endpoint as retryable.
+
+    429 and 5xx are the usual transient cases. A 400 is normally fatal (bad
+    input / model id), except HF's "workload is not stopped" — that's a
+    transitional endpoint lifecycle state, not a bad request, so it's retryable.
+    """
+    if status_code == 429 or 500 <= status_code < 600:
+        return True
+    return status_code == 400 and _HF_TRANSITIONAL_BODY in (body or "").lower()
+
+
+def _wait_for_remote_ready(model):
+    """Poll the remote endpoint with a tiny embed until it returns 200.
+
+    Slamming HF_DEDICATED_CONCURRENCY workers at a cold/scaling endpoint is what
+    produced the 503 → 400 "workload is not stopped" chain that aborted the
+    whole run. Block on a single successful probe first (up to
+    _REMOTE_READY_TIMEOUT_S), retrying only transitional states; a genuine error
+    (bad key, bad model id) surfaces immediately.
+    """
+    cfg = model["remote_inference"]
+    headers = _remote_headers(cfg)
+    payload = _remote_payload(cfg, ["ping"])
+    deadline = time.monotonic() + _REMOTE_READY_TIMEOUT_S
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            req = urllib.request.Request(
+                cfg["url"], data=payload, headers=headers, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                resp.read()
+            access_log.info("remote_ready", extra={"attempts": attempt})
+            return
+        except urllib.error.HTTPError as e:
+            body = e.read()[:200].decode("utf-8", errors="replace")
+            if not _remote_failure_retryable(e.code, body):
+                access_log.error(
+                    "remote_ready_failed", extra={"status": e.code, "body": body}
+                )
+                raise
+            status, reason = e.code, body
+        except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
+            status, reason = "network_error", str(e)
+        if time.monotonic() >= deadline:
+            access_log.error(
+                "remote_ready_timeout",
+                extra={"status": status, "reason": reason, "waited_s": _REMOTE_READY_TIMEOUT_S},
+            )
+            raise RuntimeError(
+                f"remote endpoint not ready after {_REMOTE_READY_TIMEOUT_S}s "
+                f"(last status: {status})"
+            )
+        access_log.warning(
+            "remote_ready_wait",
+            extra={"status": status, "attempt": attempt, "wait_s": _REMOTE_READY_POLL_S},
+        )
+        time.sleep(_REMOTE_READY_POLL_S)
+
+
+def _embed_via_remote(model, texts, checkpoint=None):
+    """Batch-embed `texts` via the configured HF Dedicated Endpoint.
+
+    Returns a list of float vectors aligned with input order. Retries on 429,
+    transient 5xx, and HF's transitional 400 ("workload is not stopped") with
+    exponential backoff (Retry-After respected when ≥ floor). Captures the
+    response body on non-retryable failures (e.g. 400 "inputs cannot be empty")
+    to make debugging easier.
+
+    `checkpoint` (a VectorCheckpoint or no-op NullCheckpoint) reuses vectors
+    already persisted from an earlier interrupted run (only the misses are
+    re-embedded), and each completed batch is persisted as it finishes — so even
+    if a later batch raises, the run resumes from where it left off rather than
+    from zero.
+    """
+    cfg = model["remote_inference"]
+    headers = _remote_headers(cfg)
     limiter = RateLimiter(_REMOTE_EMBED_RPM, log=access_log)
 
     def _embed_batch(batch_texts):
-        # OpenAI-shape body; TEI accepts the `truncate` field on /v1/embeddings
-        # to silently handle inputs over max_input_length.
-        payload = json.dumps(
-            {"model": cfg["model_id"], "input": batch_texts, "truncate": True}
-        ).encode("utf-8")
+        payload = _remote_payload(cfg, batch_texts)
         for attempt in range(_REMOTE_EMBED_MAX_RETRIES):
             limiter.acquire()
             req = urllib.request.Request(
@@ -282,12 +407,12 @@ def _embed_via_remote(model, texts):
                 return [item["embedding"] for item in body["data"]]
             except urllib.error.HTTPError as e:
                 status = e.code
-                retryable = e.code == 429 or 500 <= e.code < 600
+                # Read the body up front — classification needs it (HF signals
+                # the transitional state via a 400 body, not a distinct code).
+                body_snippet = e.read()[:400].decode("utf-8", errors="replace")
+                retryable = _remote_failure_retryable(e.code, body_snippet)
                 retry_after = e.headers.get("Retry-After")
                 if not retryable or attempt == _REMOTE_EMBED_MAX_RETRIES - 1:
-                    # Capture body for non-retryable failures so we can debug
-                    # 400-class errors (oversize inputs, bad model id, etc.).
-                    body_snippet = e.read()[:400].decode("utf-8", errors="replace")
                     access_log.error(
                         "remote_embed_failed",
                         extra={
@@ -332,18 +457,69 @@ def _embed_via_remote(model, texts):
             )
             time.sleep(wait)
 
+    checkpoint = checkpoint or NullCheckpoint()
+    keys = [_embed_text_key(t) for t in texts]
+    out = [None] * len(texts)
+
+    # Reuse any vectors a prior interrupted run already persisted (a
+    # NullCheckpoint always misses), so API calls are spent only on the rest.
+    miss = []
+    for i, k in enumerate(keys):
+        cached = checkpoint.get(k)
+        if cached is not None:
+            out[i] = cached
+        else:
+            miss.append(i)
+    if 0 < len(miss) < len(texts):
+        access_log.info(
+            "remote_embed_resumed",
+            extra={"cached": len(texts) - len(miss), "remaining": len(miss)},
+        )
+
+    if not miss:
+        return out
+
+    # Batch over the (global) miss indices so vector positions and cache keys
+    # stay aligned with the original input order.
     batches = [
-        texts[i : i + _REMOTE_EMBED_BATCH_SIZE]
-        for i in range(0, len(texts), _REMOTE_EMBED_BATCH_SIZE)
+        miss[i : i + _REMOTE_EMBED_BATCH_SIZE]
+        for i in range(0, len(miss), _REMOTE_EMBED_BATCH_SIZE)
     ]
-    out = [None] * len(batches)
+    first_error = None
     with ThreadPoolExecutor(max_workers=_REMOTE_EMBED_CONCURRENCY) as ex:
-        future_to_idx = {ex.submit(_embed_batch, b): i for i, b in enumerate(batches)}
+        future_to_idxs = {
+            ex.submit(_embed_batch, [texts[i] for i in idxs]): idxs
+            for idxs in batches
+        }
         # as_completed yields futures in completion order, so a single slow batch
         # doesn't idle workers that finished after it but were submitted earlier.
-        for f in as_completed(future_to_idx):
-            out[future_to_idx[f]] = f.result()
-    return [v for batch in out for v in batch]
+        # Drain every future even after one fails: persist all successes (so the
+        # next run resumes) and raise the first error only once the pool is done.
+        for f in as_completed(future_to_idxs):
+            idxs = future_to_idxs[f]
+            try:
+                vectors = f.result()
+            except Exception as e:  # noqa: BLE001 — re-raised after draining
+                if first_error is None:
+                    first_error = e
+                continue
+            # A short response would let zip() silently leave None holes in out,
+            # which then get indexed as `embeddings: null`. Treat any count
+            # mismatch as a failed batch so the run aborts (and the checkpoint is
+            # preserved) instead of writing corrupt vectors.
+            if len(vectors) != len(idxs):
+                if first_error is None:
+                    first_error = RuntimeError(
+                        f"remote returned {len(vectors)} vectors for a batch of "
+                        f"{len(idxs)} inputs"
+                    )
+                continue
+            for i, vec in zip(idxs, vectors):
+                out[i] = vec
+            checkpoint.put_many((keys[i], vec) for i, vec in zip(idxs, vectors))
+    if first_error is not None:
+        raise first_error
+    return out
 
 
 def _attach_semantic_field(paired):
@@ -374,12 +550,19 @@ def _inline_chunk_doc(doc, text, vec, inference_id, model_settings):
     }
 
 
-def _rewrite_inline_chunks(docs, model):
+def _rewrite_inline_chunks(docs, model, checkpoint=None):
     """Replace each doc's plain-text SEMANTIC_FIELD with the full inline-chunks
     structure, with vectors fetched from the model's remote inference API.
 
     Called only on docs about to be bulk-sent (after incremental diffing) so we
     don't burn API quota embedding unchanged docs.
+
+    The optional `checkpoint` is owned by the caller (open/discard/close): if
+    embedding raises partway, the partial vectors stay persisted so the next run
+    resumes. The caller must only discard() it once the ES bulk step that
+    consumes these vectors has actually succeeded — discarding here would throw
+    the cache away while a downstream bulk failure could still force a full
+    re-embed.
     """
     remote = model["remote_inference"]
     texts = [doc[SEMANTIC_FIELD] for doc in docs]
@@ -394,8 +577,12 @@ def _rewrite_inline_chunks(docs, model):
             "rpm": _REMOTE_EMBED_RPM,
         },
     )
+    # Pre-flight: wait for the endpoint to be warm before fanning batches out at
+    # it, instead of triggering the cold-start 503 → 400 chain that aborts runs.
+    _wait_for_remote_ready(model)
+
     t0 = time.time()
-    vectors = _embed_via_remote(model, texts)
+    vectors = _embed_via_remote(model, texts, checkpoint=checkpoint)
     access_log.info(
         "remote_embed_done",
         extra={
@@ -526,29 +713,36 @@ def _rebuild_index(index_name, documents, non_indexed_fields, model=None):
         mappings=_make_mappings(non_indexed_fields, model),
         settings=_make_settings(),
     )
-    try:
-        if model and model.get("remote_inference"):
-            documents = _rewrite_inline_chunks(documents, model)
-        success, errors = _bulk_index(documents, new_index, timeout=timeout)
-        if success == 0:
+    # Checkpoint lifecycle lives here (not in _rewrite_inline_chunks) so the
+    # resume cache is only discarded once the bulk index + alias swap succeed;
+    # the context manager always close()s it on the way out.
+    with _open_checkpoint(model) as checkpoint:
+        try:
+            if model and model.get("remote_inference"):
+                documents = _rewrite_inline_chunks(documents, model, checkpoint)
+            success, errors = _bulk_index(documents, new_index, timeout=timeout)
+            if success == 0:
+                # Bulk wholesale-failed; keep the checkpoint so a retry resumes.
+                es_client.indices.delete(index=new_index, ignore_unavailable=True)
+                return {"mode": "rebuild", "success_count": 0, "errors": errors}
+
+            old_indices = []
+            if es_client.indices.exists_alias(name=index_name):
+                old_indices = list(es_client.indices.get_alias(name=index_name).keys())
+            elif es_client.indices.exists(index=index_name):
+                es_client.indices.delete(index=index_name)
+
+            actions = [{"add": {"index": new_index, "alias": index_name}}]
+            for old in old_indices:
+                actions.append({"remove": {"index": old, "alias": index_name}})
+            es_client.indices.update_aliases(actions=actions)
+            for old in old_indices:
+                es_client.indices.delete(index=old, ignore_unavailable=True)
+            # Index is live — vectors are durably in ES, so the cache is dead weight.
+            checkpoint.discard()
+        except Exception:
             es_client.indices.delete(index=new_index, ignore_unavailable=True)
-            return {"mode": "rebuild", "success_count": 0, "errors": errors}
-
-        old_indices = []
-        if es_client.indices.exists_alias(name=index_name):
-            old_indices = list(es_client.indices.get_alias(name=index_name).keys())
-        elif es_client.indices.exists(index=index_name):
-            es_client.indices.delete(index=index_name)
-
-        actions = [{"add": {"index": new_index, "alias": index_name}}]
-        for old in old_indices:
-            actions.append({"remove": {"index": old, "alias": index_name}})
-        es_client.indices.update_aliases(actions=actions)
-        for old in old_indices:
-            es_client.indices.delete(index=old, ignore_unavailable=True)
-    except Exception:
-        es_client.indices.delete(index=new_index, ignore_unavailable=True)
-        raise
+            raise
 
     return {"mode": "rebuild", "success_count": success, "errors": errors}
 
@@ -579,15 +773,21 @@ def _incremental_index(index_name, documents, model=None):
     ]
     to_delete = [doc_id for doc_id in existing_hashes if doc_id not in incoming]
 
-    if to_index and model and model.get("remote_inference"):
-        to_index = _rewrite_inline_chunks(to_index, model)
-
-    actions = to_index + [{"_op_type": "delete", "_id": did} for did in to_delete]
-
+    # Checkpoint lifecycle lives here (not in _rewrite_inline_chunks) so the
+    # resume cache is only discarded once the bulk index actually succeeds; the
+    # context manager always close()s it. No real cache unless there's something
+    # to embed (passing model=None yields a no-op NullCheckpoint).
     timeout = SEMANTIC_BULK_TIMEOUT_S if model else LEXICAL_BULK_TIMEOUT_S
     success, errors = 0, []
-    if actions:
-        success, errors = _bulk_index(actions, index_name, timeout=timeout)
+    with _open_checkpoint(model if to_index else None) as checkpoint:
+        if to_index and model and model.get("remote_inference"):
+            to_index = _rewrite_inline_chunks(to_index, model, checkpoint)
+
+        actions = to_index + [{"_op_type": "delete", "_id": did} for did in to_delete]
+        if actions:
+            success, errors = _bulk_index(actions, index_name, timeout=timeout)
+        # Bulk completed — embedded vectors are durably in ES; drop the cache.
+        checkpoint.discard()
 
     return {
         "mode": "incremental",
