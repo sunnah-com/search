@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import socket
 import sys
 import time
 import urllib.request
@@ -217,6 +218,10 @@ _REMOTE_EMBED_BATCH_SIZE = int(os.environ.get("HF_DEDICATED_BATCH_SIZE", "16"))
 _REMOTE_EMBED_RPM = int(os.environ.get("HF_DEDICATED_RPM", "-1"))
 _REMOTE_EMBED_MAX_RETRIES = 6
 _REMOTE_EMBED_BACKOFF_FLOOR_S = 5
+# Upper bound on a single retry wait, including any value the server suggests
+# via Retry-After. Without this cap a 503 with `Retry-After: 600` would stall
+# a worker for 10 minutes per attempt; 6 attempts × 10 min = 1 hour idle.
+_REMOTE_EMBED_BACKOFF_CEILING_S = 60
 
 
 def _embed_via_remote(model, texts):
@@ -242,13 +247,18 @@ def _embed_via_remote(model, texts):
         for attempt in range(_REMOTE_EMBED_MAX_RETRIES):
             limiter.acquire()
             req = urllib.request.Request(cfg["url"], data=payload, headers=headers, method="POST")
+
+            status = None
+            retry_after = None
             try:
                 with urllib.request.urlopen(req, timeout=120) as resp:
                     body = json.loads(resp.read())
                 # TEI's /v1/embeddings returns OpenAI shape with L2-normalized vectors.
                 return [item["embedding"] for item in body["data"]]
             except urllib.error.HTTPError as e:
+                status = e.code
                 retryable = e.code == 429 or 500 <= e.code < 600
+                retry_after = e.headers.get("Retry-After")
                 if not retryable or attempt == _REMOTE_EMBED_MAX_RETRIES - 1:
                     # Capture body for non-retryable failures so we can debug
                     # 400-class errors (oversize inputs, bad model id, etc.).
@@ -259,16 +269,31 @@ def _embed_via_remote(model, texts):
                                "batch_size": len(batch_texts)},
                     )
                     raise
-                retry_after = e.headers.get("Retry-After")
-                parsed = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else 0
-                # TEI sometimes returns Retry-After: 0 — enforce a floor so we
-                # don't immediately re-fire and ladder up retry attempts.
-                wait = max(parsed, _REMOTE_EMBED_BACKOFF_FLOOR_S, min(2 ** attempt, 30))
-                access_log.warning(
-                    "remote_embed_retry",
-                    extra={"status": e.code, "attempt": attempt + 1, "wait_s": wait},
-                )
-                time.sleep(wait)
+            except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
+                # DNS failure, connect refused, read timeout, RST mid-stream —
+                # treat as transient and retry rather than killing the run.
+                status = "network_error"
+                if attempt == _REMOTE_EMBED_MAX_RETRIES - 1:
+                    access_log.error(
+                        "remote_embed_failed",
+                        extra={"status": status, "reason": str(e),
+                               "batch_size": len(batch_texts)},
+                    )
+                    raise
+
+            # Shared backoff path for any retryable failure above.
+            parsed = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else 0
+            # TEI sometimes returns Retry-After: 0 — enforce a floor so we don't
+            # immediately re-fire. Cap Retry-After so a single misbehaving 503
+            # can't park a worker for many minutes.
+            wait = max(min(parsed, _REMOTE_EMBED_BACKOFF_CEILING_S),
+                       _REMOTE_EMBED_BACKOFF_FLOOR_S,
+                       min(2 ** attempt, 30))
+            access_log.warning(
+                "remote_embed_retry",
+                extra={"status": status, "attempt": attempt + 1, "wait_s": wait},
+            )
+            time.sleep(wait)
 
     batches = [texts[i:i + _REMOTE_EMBED_BATCH_SIZE]
                for i in range(0, len(texts), _REMOTE_EMBED_BATCH_SIZE)]
