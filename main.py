@@ -738,14 +738,19 @@ def search(language):
     query = request.args.get("q")
     filters = get_filter_from_args(request.args)
     mode = _resolve_mode(request.args)
-    model_key, model = None, None
+
     if mode == SearchMode.SEMANTIC:
         model_key, err = _resolve_model_key(request.args)
         if err:
             return jsonify({"error": err}), 400
-        model = _ENABLED_MODELS.get(model_key) if model_key else None
-    search_index = model["index"] if model else LEXICAL_INDEX
+        model = _ENABLED_MODELS[model_key]
+        access_log.info("semantic_search", extra={
+            "request_id": getattr(g, "request_id", None),
+            "mode": mode, "model": model_key, "query": query,
+        })
+        return _semantic_search(model["index"], query, filters)
 
+    # Lexical path
     fields = ["hadithNumber^2", "hadithText", "arabicText", "collection^2"]
 
     def build_lexical(query_type):
@@ -764,14 +769,6 @@ def search(language):
             }
         }
 
-    if mode == SearchMode.SEMANTIC:
-        access_log.info("semantic_search", extra={
-            "request_id": getattr(g, "request_id", None),
-            "mode": mode, "model": model_key, "query": query,
-        })
-        return _semantic_search(search_index, query, filters)
-
-    # Lexical path
     kwargs = {
         "index": LEXICAL_INDEX,
         "from_": request.args.get("from", 0),
