@@ -144,8 +144,11 @@ _ENABLED_MODELS = EMBEDDING_MODELS if SEMANTIC_ENABLED else {}
 # semantic model doesn't accidentally change which one is the default.
 DEFAULT_SEMANTIC_MODEL = "mxbai"
 
-# Bulk timeout — embedding calls during indexing are slow.
-BULK_REQUEST_TIMEOUT = 300 if SEMANTIC_ENABLED else 60
+# Bulk-indexing timeouts. Semantic bulk can be slow because ES embeds each
+# doc against the inference endpoint (Ollama) unless we shipped inline chunks;
+# lexical bulk is just text ingest and stays fast.
+LEXICAL_BULK_TIMEOUT_S = 60
+SEMANTIC_BULK_TIMEOUT_S = 300
 
 SEARCH_MODES = ("lexical", "semantic")
 SEMANTIC_MODES = ("semantic",)
@@ -377,12 +380,12 @@ def _rewrite_inline_chunks(docs, model):
             for doc, text, vec in zip(docs, texts, vectors)]
 
 
-def _bulk_index(actions, index, timeout=None):
+def _bulk_index(actions, index, timeout):
     return helpers.bulk(
         es_client,
         actions,
         index=index,
-        request_timeout=timeout or BULK_REQUEST_TIMEOUT,
+        request_timeout=timeout,
         raise_on_error=False,
         raise_on_exception=False,
     )
@@ -465,7 +468,7 @@ def _make_mappings(non_indexed_fields, model=None):
 def _rebuild_index(index_name, documents, non_indexed_fields, model=None):
     # time_ns avoids collisions when two rebuilds land in the same second.
     new_index = f"{index_name}-{time.time_ns()}"
-    timeout = BULK_REQUEST_TIMEOUT if model else 60
+    timeout = SEMANTIC_BULK_TIMEOUT_S if model else LEXICAL_BULK_TIMEOUT_S
     es_client.indices.create(
         index=new_index,
         mappings=_make_mappings(non_indexed_fields, model),
@@ -524,7 +527,7 @@ def _incremental_index(index_name, documents, model=None):
 
     actions = to_index + [{"_op_type": "delete", "_id": did} for did in to_delete]
 
-    timeout = BULK_REQUEST_TIMEOUT if model else 60
+    timeout = SEMANTIC_BULK_TIMEOUT_S if model else LEXICAL_BULK_TIMEOUT_S
     success, errors = 0, []
     if actions:
         success, errors = _bulk_index(actions, index_name, timeout=timeout)
