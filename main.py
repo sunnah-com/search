@@ -150,8 +150,9 @@ DEFAULT_SEMANTIC_MODEL = "mxbai"
 LEXICAL_BULK_TIMEOUT_S = 60
 SEMANTIC_BULK_TIMEOUT_S = 300
 
-SEARCH_MODES = ("lexical", "semantic")
-SEMANTIC_MODES = ("semantic",)
+# Search modes. Two values, only ever compared as strings.
+LEXICAL_MODE = "lexical"
+SEMANTIC_MODE = "semantic"
 
 COLLECTION_BOOSTS = [
     ("bukhari", 5.0),
@@ -702,12 +703,13 @@ def get_filter_from_args(args):
 
 
 def _resolve_mode(args):
-    mode = args.get("mode", "lexical").lower()
-    if mode not in SEARCH_MODES:
-        mode = "lexical"
-    if mode in SEMANTIC_MODES and not SEMANTIC_ENABLED:
-        mode = "lexical"
-    return mode
+    """Normalize ?mode=... to either LEXICAL_MODE or SEMANTIC_MODE. Falls back
+    to lexical for unknown values and whenever SEMANTIC_ENABLED is off.
+    """
+    requested = (args.get("mode") or "").lower()
+    if requested == SEMANTIC_MODE and SEMANTIC_ENABLED:
+        return SEMANTIC_MODE
+    return LEXICAL_MODE
 
 
 def _resolve_model_key(args):
@@ -729,7 +731,7 @@ def search(language):
     filters = get_filter_from_args(request.args)
     mode = _resolve_mode(request.args)
     model_key, model = None, None
-    if mode in SEMANTIC_MODES:
+    if mode == SEMANTIC_MODE:
         model_key, err = _resolve_model_key(request.args)
         if err:
             return jsonify({"error": err}), 400
@@ -754,7 +756,7 @@ def search(language):
             }
         }
 
-    if mode in SEMANTIC_MODES:
+    if mode == SEMANTIC_MODE:
         access_log.info("semantic_search", extra={
             "request_id": getattr(g, "request_id", None),
             "mode": mode, "model": model_key, "query": query,
