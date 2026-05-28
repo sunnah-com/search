@@ -72,7 +72,6 @@ services:
       - GC_PROM_USER=${GC_PROM_USER}
       - GC_PROM_PASSWORD=${GC_PROM_PASSWORD}
       - DEPLOY_ENV=${DEPLOY_ENV:-local}
-
 networks:
   default:
     driver: bridge
