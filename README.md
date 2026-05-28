@@ -179,7 +179,7 @@ Mode is passed as a query parameter:
 /english/search?q=prayer&mode=lexical
 ```
 
-`mode=semantic` uses the only enabled embedding model by default — you can pin a specific one with `&model=mxbai` if more than one is enabled.
+`mode=semantic` uses the model named in `DEFAULT_SEMANTIC_MODEL` (currently `mxbai`) when no `&model=` is supplied. Pass `&model=<key>` to pick a different enabled model.
 
 ---
 
