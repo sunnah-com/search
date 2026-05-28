@@ -139,6 +139,11 @@ EMBEDDING_MODELS = {
 
 _ENABLED_MODELS = EMBEDDING_MODELS if SEMANTIC_ENABLED else {}
 
+# Which model `/search?mode=semantic` picks when no `model=` param is given.
+# Set explicitly rather than reading the first dict key, so adding another
+# semantic model doesn't accidentally change which one is the default.
+DEFAULT_SEMANTIC_MODEL = "mxbai"
+
 # Bulk timeout — embedding calls during indexing are slow.
 BULK_REQUEST_TIMEOUT = 300 if SEMANTIC_ENABLED else 60
 
@@ -704,9 +709,7 @@ def _resolve_mode(args):
 
 def _resolve_model_key(args):
     """Returns (key, error_message). error_message is non-None for explicit invalid input."""
-    key = args.get("model")
-    if not key:
-        return next(iter(_ENABLED_MODELS), None), None
+    key = args.get("model") or DEFAULT_SEMANTIC_MODEL
     if key in _ENABLED_MODELS:
         return key, None
     return None, f"unknown model '{key}'; enabled: {sorted(_ENABLED_MODELS)}"
