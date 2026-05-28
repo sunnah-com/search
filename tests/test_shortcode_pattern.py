@@ -41,7 +41,7 @@ class ShortcodeStripTests(unittest.TestCase):
 
     def test_strips_unknown_but_shortcode_shaped_tags(self):
         # Future-proofing: any tag-shaped token is stripped.
-        self.assertEqual(strip("[somefuture id=\"5\"]z[/somefuture]"), " z ")
+        self.assertEqual(strip('[somefuture id="5"]z[/somefuture]'), " z ")
 
     def test_preserves_multi_word_parenthetical_asides(self):
         s = "Keep [bleeding (from the womb) in between a woman periods] intact"
@@ -53,7 +53,9 @@ class ShortcodeStripTests(unittest.TestCase):
 
     def test_preserves_text_outside_shortcodes(self):
         s = "The Prophet (saws) said, [matn]be kind[/matn] to your neighbor."
-        self.assertEqual(strip(s), "The Prophet (saws) said,  be kind  to your neighbor.")
+        self.assertEqual(
+            strip(s), "The Prophet (saws) said,  be kind  to your neighbor."
+        )
 
     def test_does_not_match_brackets_with_leading_space(self):
         # Tag name must be the first thing after `[`.
