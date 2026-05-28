@@ -563,8 +563,23 @@ def index():
     if request.args.get("password") != os.environ.get("INDEXING_PASSWORD"):
         return "Must provide valid password to index", 401
 
-    target_model = request.args.get("model")  # index only this model when specified
     force_rebuild = _is_truthy(request.args.get("rebuild"))
+
+    # ?targets=… is a comma-separated subset of {lexical, <each enabled model>}.
+    # Missing → build everything. Empty or unknown → 400 (don't silently
+    # misinterpret a typo as "do nothing" or "do everything").
+    valid_targets = {"lexical", *_ENABLED_MODELS}
+    raw_targets = request.args.get("targets")
+    if raw_targets is None:
+        targets = valid_targets
+    else:
+        targets = {t.strip() for t in raw_targets.split(",") if t.strip()}
+        if not targets:
+            return jsonify({"error": "targets= must be a non-empty comma-separated list"}), 400
+        unknown = targets - valid_targets
+        if unknown:
+            return jsonify({"error": f"unknown targets {sorted(unknown)}; "
+                                     f"valid: {sorted(valid_targets)}"}), 400
 
     connection = pymysql.connect(
         host=os.environ.get("MYSQL_HOST"),
@@ -618,29 +633,11 @@ def index():
     # Semantic index: full multilingual corpus — every Arabic doc gets its Arabic text
     # embedded, every English doc gets its English text embedded. This lets a multilingual
     # model like text-embedding-3-small retrieve across both languages from one index.
-    # Decide what to build from ?model=…:
-    #   missing       → lexical + every enabled semantic model
-    #   "lexical"     → lexical only
-    #   <model key>   → that semantic model only
-    #   anything else → 400, don't silently misinterpret
-    if target_model is None:
-        build_lexical = True
-        models_to_index = _ENABLED_MODELS
-    elif target_model == "lexical":
-        build_lexical = True
-        models_to_index = {}
-    elif target_model in _ENABLED_MODELS:
-        build_lexical = False
-        models_to_index = {target_model: _ENABLED_MODELS[target_model]}
-    else:
-        valid = ["lexical", *sorted(_ENABLED_MODELS)]
-        return jsonify({"error": f"unknown model '{target_model}'; "
-                                 f"valid: {valid}"}), 400
-
     results = {}
-    if build_lexical:
+    if "lexical" in targets:
         results["lexical"] = _index_one(LEXICAL_INDEX, lexical_docs, non_indexed,
                                          model=None, force_rebuild=force_rebuild)
+    models_to_index = {k: v for k, v in _ENABLED_MODELS.items() if k in targets}
     for model_key, model in models_to_index.items():
         _ensure_inference_endpoint(model)
         if model.get("multilingual"):

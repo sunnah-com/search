@@ -64,10 +64,11 @@ http://localhost:5000/index?password=index123
 
 This reads all hadiths from MySQL and builds **both** the lexical and semantic indexes by default — that's almost always what you want. Embedding ~48k English hadiths takes ~9 min via the HF Dedicated Endpoint (or considerably longer through Ollama if no remote endpoint is configured).
 
-To build only one of the two, pass `model=`:
+To build a subset, pass `targets=` (comma-separated):
 ```
-http://localhost:5000/index?password=index123&model=lexical   # lexical only
-http://localhost:5000/index?password=index123&model=mxbai     # semantic only
+http://localhost:5000/index?password=index123&targets=lexical          # lexical only
+http://localhost:5000/index?password=index123&targets=mxbai            # one semantic model
+http://localhost:5000/index?password=index123&targets=lexical,mxbai    # both (same as default)
 ```
 
 To force a full rebuild instead of incremental:
@@ -134,7 +135,7 @@ The prod stack is exposed on **port 7650**. Builds both lexical and semantic by 
 http://<server>:7650/index?password=<INDEXING_PASSWORD>
 ```
 
-Add `&model=lexical` or `&model=mxbai` to build just one.
+Add `&targets=lexical` or `&targets=mxbai` to build a subset.
 
 Check index status:
 ```
