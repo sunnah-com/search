@@ -38,7 +38,7 @@ Each index name in ES is an **alias** (e.g. `english-mxbai`) pointing to a times
 cp .env.sample .env
 ```
 
-For semantic search, set `MXBAI_ENABLED=true` in `.env`. `OLLAMA_URL` defaults to `http://host.docker.internal:11434`, which works on Docker Desktop (Mac/Windows) — leave it unset locally.
+Semantic search is on by default (`SEMANTIC_ENABLED=true`). Set it to `false` if you want lexical-only and don't want to run Ollama. `OLLAMA_URL` defaults to `http://host.docker.internal:11434`, which works on Docker Desktop (Mac/Windows) — leave it unset locally.
 
 To offload index-time embedding to a HuggingFace Dedicated Inference Endpoint (recommended for prod — orders of magnitude faster on a small GPU than Ollama on a CPU instance), also set `HUGGING_FACE_KEY` and `HF_DEDICATED_URL` in `.env`. The endpoint must run [TEI](https://github.com/huggingface/text-embeddings-inference) with `mixedbread-ai/mxbai-embed-large-v1`. Leaving either var unset falls back to embedding via Ollama at index time too.
 
@@ -62,12 +62,12 @@ Flask is exposed on **port 5000**.
 http://localhost:5000/index?password=index123
 ```
 
-This reads all hadiths from MySQL and builds both the lexical and mxbai indexes. Embedding ~48k English hadiths takes ~9 min via the HF Dedicated Endpoint (or considerably longer through Ollama if no remote endpoint is configured).
+This reads all hadiths from MySQL and builds **both** the lexical and semantic indexes by default — that's almost always what you want. Embedding ~48k English hadiths takes ~9 min via the HF Dedicated Endpoint (or considerably longer through Ollama if no remote endpoint is configured).
 
-To index only one at a time:
+To build only one of the two, pass `model=`:
 ```
-http://localhost:5000/index?password=index123&model=mxbai
-http://localhost:5000/index?password=index123&model=lexical
+http://localhost:5000/index?password=index123&model=lexical   # lexical only
+http://localhost:5000/index?password=index123&model=mxbai     # semantic only
 ```
 
 To force a full rebuild instead of incremental:
@@ -107,7 +107,7 @@ MYSQL_DATABASE=hadithdb
 ELASTIC_PASSWORD=<strong password>
 INDEXING_PASSWORD=<strong password>
 
-MXBAI_ENABLED=true
+SEMANTIC_ENABLED=true
 ```
 
 ### 2. Ollama on Linux
@@ -128,17 +128,13 @@ docker compose -f docker-compose.prod.yml up -d --build
 
 ### 4. Build the indexes
 
-The prod stack is exposed on **port 7650**:
+The prod stack is exposed on **port 7650**. Builds both lexical and semantic by default:
 
 ```
 http://<server>:7650/index?password=<INDEXING_PASSWORD>
 ```
 
-To index only one at a time:
-```
-http://<server>:7650/index?password=<INDEXING_PASSWORD>&model=mxbai
-http://<server>:7650/index?password=<INDEXING_PASSWORD>&model=lexical
-```
+Add `&model=lexical` or `&model=mxbai` to build just one.
 
 Check index status:
 ```
@@ -176,9 +172,11 @@ Per-run tuning via env vars: `HF_DEDICATED_CONCURRENCY` (default 4), `HF_DEDICAT
 
 Mode is passed as a query parameter:
 ```
-/english/search?q=prayer&mode=semantic&model=mxbai
+/english/search?q=prayer&mode=semantic
 /english/search?q=prayer&mode=lexical
 ```
+
+`mode=semantic` uses the only enabled embedding model by default — you can pin a specific one with `&model=mxbai` if more than one is enabled.
 
 ---
 

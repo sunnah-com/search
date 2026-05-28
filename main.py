@@ -109,12 +109,15 @@ def _build_remote_mxbai_inference():
     }
 
 
+SEMANTIC_ENABLED = _is_truthy(os.environ.get("SEMANTIC_ENABLED"))
+
+# Catalog of semantic models. Pure data — no env coupling. Add an entry here
+# to register another model; the on/off switch lives on SEMANTIC_ENABLED above.
 EMBEDDING_MODELS = {
     "mxbai": {
         "label": "mxbai-embed-large",
         "index": "english-mxbai",
         "inference_id": "mxbai-embed-large",
-        "enabled": _is_truthy(os.environ.get("MXBAI_ENABLED")),
         "multilingual": False,
         # ES inference endpoint — always bound to local Ollama (query-time embedding).
         # Ollama exposes an OpenAI-compatible API; ES 8.16 has no native ollama service.
@@ -134,8 +137,7 @@ EMBEDDING_MODELS = {
     },
 }
 
-_ENABLED_MODELS = {k: v for k, v in EMBEDDING_MODELS.items() if v["enabled"]}
-SEMANTIC_ENABLED = bool(_ENABLED_MODELS)
+_ENABLED_MODELS = EMBEDDING_MODELS if SEMANTIC_ENABLED else {}
 
 # Bulk timeout — embedding calls during indexing are slow.
 BULK_REQUEST_TIMEOUT = 300 if SEMANTIC_ENABLED else 60
