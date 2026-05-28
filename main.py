@@ -2,7 +2,10 @@ import hashlib
 import logging
 import sys
 import time
+import urllib.request
+import urllib.error
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify, g
 from werkzeug.exceptions import HTTPException
 import pymysql
@@ -13,6 +16,7 @@ import json
 from elasticsearch import Elasticsearch, helpers, BadRequestError, NotFoundError
 from pythonjsonlogger import jsonlogger
 
+from utils.rate_limiter import RateLimiter
 from utils.shortcode_pattern import SHORTCODE_PATTERN
 
 load_dotenv(".env.local")
@@ -80,6 +84,29 @@ LEXICAL_INDEX = "english-lexical"
 SEMANTIC_FIELD = "semantic_text"
 
 _OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://host.docker.internal:11434")
+_HUGGING_FACE_KEY = os.environ.get("HUGGING_FACE_KEY")
+_HF_DEDICATED_URL = os.environ.get("HF_DEDICATED_URL")  # e.g. https://<id>.endpoints.huggingface.cloud
+
+# Embedding vector dimensions for mxbai-embed-large(-v1). Used for inline chunks.
+_MXBAI_DIMS = 1024
+
+
+def _build_remote_inference():
+    """Index-time embedding via a HuggingFace Inference Endpoint running TEI.
+
+    The endpoint exposes an OpenAI-compatible /v1/embeddings route that returns
+    L2-normalized vectors directly. Returns None (→ fall back to ES inference
+    via Ollama at index time) when either env var is missing.
+    """
+    if not (_HUGGING_FACE_KEY and _HF_DEDICATED_URL):
+        return None
+    return {
+        "url": f"{_HF_DEDICATED_URL.rstrip('/')}/v1/embeddings",
+        "api_key": _HUGGING_FACE_KEY,
+        "model_id": "mxbai",  # TEI ignores model field, but OpenAI shape requires it
+        "dims": _MXBAI_DIMS,
+    }
+
 
 EMBEDDING_MODELS = {
     "mxbai": {
@@ -88,7 +115,8 @@ EMBEDDING_MODELS = {
         "inference_id": "mxbai-embed-large",
         "enabled": _is_truthy(os.environ.get("MXBAI_ENABLED")),
         "multilingual": False,
-        # Ollama exposes an OpenAI-compatible API — use that since ES 8.16 has no native ollama service.
+        # ES inference endpoint — always bound to local Ollama (query-time embedding).
+        # Ollama exposes an OpenAI-compatible API; ES 8.16 has no native ollama service.
         "service": "openai",
         "service_settings": {
             "api_key": "ollama",  # Ollama doesn't require auth; ES requires a non-empty value
@@ -96,6 +124,12 @@ EMBEDDING_MODELS = {
             "model_id": "mxbai-embed-large",
             "similarity": "cosine",
         },
+        # Optional remote inference for index time only. When set, the indexer
+        # pre-computes vectors via the HF Dedicated Endpoint and ships them
+        # inline in the bulk payload (semantic_text accepts pre-populated chunks
+        # and skips its own inference call). Query time always goes through the
+        # ES inference endpoint above (local Ollama).
+        "remote_inference": _build_remote_inference(),
     },
 }
 
@@ -168,6 +202,155 @@ def _prepare_documents(documents):
     for doc in documents:
         doc["_id"] = f"{doc['lang']}:{doc['urn']}"
         doc["contentHash"] = _content_hash(doc)
+
+
+# TEI (Text Embeddings Inference) tuning, all env-overridable:
+#   HF_DEDICATED_CONCURRENCY: HF's per-endpoint pool starts 429ing well below
+#     TEI's stated max_concurrent_requests=512. c=4 is empirically clean; raise
+#     when the endpoint is configured with higher autoscale.
+#   HF_DEDICATED_BATCH_SIZE: batch_size × max_input_length must stay under TEI's
+#     max_batch_tokens (default 16384). 16 × 512 = 8192 leaves headroom.
+_REMOTE_EMBED_CONCURRENCY = int(os.environ.get("HF_DEDICATED_CONCURRENCY", "4"))
+_REMOTE_EMBED_BATCH_SIZE = int(os.environ.get("HF_DEDICATED_BATCH_SIZE", "16"))
+# HF Dedicated bills by compute-time, not RPM — default no throttle. Override
+# via HF_DEDICATED_RPM (set >0) if you ever hit per-endpoint rate limits.
+_REMOTE_EMBED_RPM = int(os.environ.get("HF_DEDICATED_RPM", "-1"))
+_REMOTE_EMBED_MAX_RETRIES = 6
+_REMOTE_EMBED_BACKOFF_FLOOR_S = 5
+
+
+def _embed_via_remote(model, texts):
+    """Batch-embed `texts` via the configured HF Dedicated Endpoint.
+
+    Returns a list of float vectors aligned with input order. Retries on 429
+    and transient 5xx with exponential backoff (Retry-After respected when
+    ≥ floor). Captures the response body on non-retryable failures (e.g. 400
+    "inputs cannot be empty") to make debugging easier.
+    """
+    cfg = model["remote_inference"]
+    headers = {
+        "Authorization": f"Bearer {cfg['api_key']}",
+        "Content-Type": "application/json",
+    }
+    limiter = RateLimiter(_REMOTE_EMBED_RPM, log=access_log)
+
+    def _embed_batch(batch_texts):
+        # OpenAI-shape body; TEI accepts the `truncate` field on /v1/embeddings
+        # to silently handle inputs over max_input_length.
+        payload = json.dumps({"model": cfg["model_id"], "input": batch_texts,
+                              "truncate": True}).encode("utf-8")
+        for attempt in range(_REMOTE_EMBED_MAX_RETRIES):
+            limiter.acquire()
+            req = urllib.request.Request(cfg["url"], data=payload, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    body = json.loads(resp.read())
+                # TEI's /v1/embeddings returns OpenAI shape with L2-normalized vectors.
+                return [item["embedding"] for item in body["data"]]
+            except urllib.error.HTTPError as e:
+                retryable = e.code == 429 or 500 <= e.code < 600
+                if not retryable or attempt == _REMOTE_EMBED_MAX_RETRIES - 1:
+                    # Capture body for non-retryable failures so we can debug
+                    # 400-class errors (oversize inputs, bad model id, etc.).
+                    body_snippet = e.read()[:400].decode("utf-8", errors="replace")
+                    access_log.error(
+                        "remote_embed_failed",
+                        extra={"status": e.code, "body": body_snippet,
+                               "batch_size": len(batch_texts)},
+                    )
+                    raise
+                retry_after = e.headers.get("Retry-After")
+                parsed = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else 0
+                # TEI sometimes returns Retry-After: 0 — enforce a floor so we
+                # don't immediately re-fire and ladder up retry attempts.
+                wait = max(parsed, _REMOTE_EMBED_BACKOFF_FLOOR_S, min(2 ** attempt, 30))
+                access_log.warning(
+                    "remote_embed_retry",
+                    extra={"status": e.code, "attempt": attempt + 1, "wait_s": wait},
+                )
+                time.sleep(wait)
+
+    batches = [texts[i:i + _REMOTE_EMBED_BATCH_SIZE]
+               for i in range(0, len(texts), _REMOTE_EMBED_BATCH_SIZE)]
+    out = [None] * len(batches)
+    with ThreadPoolExecutor(max_workers=_REMOTE_EMBED_CONCURRENCY) as ex:
+        future_to_idx = {ex.submit(_embed_batch, b): i for i, b in enumerate(batches)}
+        for f in future_to_idx:
+            out[future_to_idx[f]] = f.result()
+    return [v for batch in out for v in batch]
+
+
+def _attach_semantic_field(paired):
+    """Attach SEMANTIC_FIELD as plain text. ES auto-embeds via the bound inference
+    endpoint (Ollama) at bulk time — unless _rewrite_inline_chunks is called first
+    to pre-populate the field with vectors from a remote inference provider.
+
+    Docs with empty text get no SEMANTIC_FIELD at all — both Ollama and TEI
+    reject empty inputs, and a doc with no hadithText can't be searched
+    semantically anyway.
+    """
+    out = []
+    for doc, text in paired:
+        if text and text.strip():
+            out.append({**doc, SEMANTIC_FIELD: text})
+        else:
+            out.append(dict(doc))
+    return out
+
+
+def _rewrite_inline_chunks(docs, model):
+    """Replace each doc's plain-text SEMANTIC_FIELD with the full inline-chunks
+    structure, with vectors fetched from the model's remote inference API.
+
+    Called only on docs about to be bulk-sent (after incremental diffing) so we
+    don't burn API quota embedding unchanged docs.
+    """
+    remote = model["remote_inference"]
+    # TEI rejects whole batches that contain any empty string ("`inputs` cannot
+    # be empty"). Filter to non-empty strings here; docs with empty text keep
+    # their empty SEMANTIC_FIELD and aren't indexed semantically.
+    embeddable = [(i, doc[SEMANTIC_FIELD]) for i, doc in enumerate(docs)
+                  if isinstance(doc.get(SEMANTIC_FIELD), str) and doc[SEMANTIC_FIELD].strip()]
+    if not embeddable:
+        return docs
+
+    indices = [i for i, _ in embeddable]
+    texts = [t for _, t in embeddable]
+    access_log.info(
+        "remote_embed_start",
+        extra={"model": model["label"], "doc_count": len(texts),
+               "batch_size": _REMOTE_EMBED_BATCH_SIZE,
+               "concurrency": _REMOTE_EMBED_CONCURRENCY,
+               "rpm": _REMOTE_EMBED_RPM},
+    )
+    t0 = time.time()
+    vectors = _embed_via_remote(model, texts)
+    access_log.info(
+        "remote_embed_done",
+        extra={"model": model["label"], "doc_count": len(texts),
+               "duration_s": round(time.time() - t0, 1)},
+    )
+
+    model_settings = {
+        "task_type": "text_embedding",
+        "dimensions": remote["dims"],
+        "similarity": "cosine",
+        "element_type": "float",
+    }
+    for idx, vec in zip(indices, vectors):
+        text = docs[idx][SEMANTIC_FIELD]
+        docs[idx] = {
+            **docs[idx],
+            SEMANTIC_FIELD: {
+                "text": text,
+                "inference": {
+                    "inference_id": model["inference_id"],
+                    "model_settings": model_settings,
+                    "chunks": [{"text": text, "embeddings": vec}],
+                },
+            },
+        }
+    return docs
 
 
 def _bulk_index(actions, index, timeout=None):
@@ -265,6 +448,8 @@ def _rebuild_index(index_name, documents, non_indexed_fields, model=None):
         settings=_make_settings(),
     )
     try:
+        if model and model.get("remote_inference"):
+            documents = _rewrite_inline_chunks(documents, model)
         success, errors = _bulk_index(documents, new_index, timeout=timeout)
         if success == 0:
             es_client.indices.delete(index=new_index, ignore_unavailable=True)
@@ -309,6 +494,10 @@ def _incremental_index(index_name, documents, model=None):
     to_index = [doc for doc_id, doc in incoming.items()
                 if existing_hashes.get(doc_id) != doc["contentHash"]]
     to_delete = [doc_id for doc_id in existing_hashes if doc_id not in incoming]
+
+    if to_index and model and model.get("remote_inference"):
+        to_index = _rewrite_inline_chunks(to_index, model)
+
     actions = to_index + [{"_op_type": "delete", "_id": did} for did in to_delete]
 
     timeout = BULK_REQUEST_TIMEOUT if model else 60
@@ -410,12 +599,14 @@ def index():
         _ensure_inference_endpoint(model)
         if model.get("multilingual"):
             # Full corpus: every Arabic doc embeds Arabic text, every English doc embeds English.
-            en_docs = [{**doc, SEMANTIC_FIELD: doc["hadithText"]} for doc in englishHadiths]
-            ar_docs = [{**doc, SEMANTIC_FIELD: doc["arabicText"]} for doc in arabicHadiths]
-            model_docs = en_docs + ar_docs
+            en_docs = [(doc, doc["hadithText"]) for doc in englishHadiths]
+            ar_docs = [(doc, doc["arabicText"]) for doc in arabicHadiths]
+            paired = en_docs + ar_docs
         else:
             # English-only — replicates colleague's original PR approach.
-            model_docs = [{**doc, SEMANTIC_FIELD: doc["hadithText"]} for doc in englishHadiths]
+            paired = [(doc, doc["hadithText"]) for doc in englishHadiths]
+
+        model_docs = _attach_semantic_field(paired)
         results[model_key] = _index_one(
             model["index"], model_docs, non_indexed, model=model, force_rebuild=force_rebuild
         )

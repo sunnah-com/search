@@ -14,10 +14,11 @@ Browser / PHP website
                                   │
                       ┌───────────┴───────────┐
                       │  english-lexical       │  BM25, no embeddings
-                      │  english-mxbai         │  mxbai-embed-large via Ollama
+                      │  english-mxbai         │  mxbai-embed-large vectors
                       └───────────────────────┘
 
-  Ollama (runs on host, port 11434) — serves mxbai-embed-large
+  Ollama (host, port 11434) — embeds search queries
+  HF Dedicated Endpoint (optional) — embeds documents at index time
 ```
 
 Each index name in ES is an **alias** (e.g. `english-mxbai`) pointing to a timestamped backing index. Reindexing builds a new backing index and atomically swaps the alias — the live index keeps serving traffic during the rebuild.
@@ -39,6 +40,8 @@ cp .env.sample .env
 
 For semantic search, set `MXBAI_ENABLED=true` in `.env`. `OLLAMA_URL` defaults to `http://host.docker.internal:11434`, which works on Docker Desktop (Mac/Windows) — leave it unset locally.
 
+To offload index-time embedding to a HuggingFace Dedicated Inference Endpoint (recommended for prod — orders of magnitude faster on a small GPU than Ollama on a CPU instance), also set `HUGGING_FACE_KEY` and `HF_DEDICATED_URL` in `.env`. The endpoint must run [TEI](https://github.com/huggingface/text-embeddings-inference) with `mixedbread-ai/mxbai-embed-large-v1`. Leaving either var unset falls back to embedding via Ollama at index time too.
+
 ### 2. Pull the model
 
 ```bash
@@ -59,7 +62,7 @@ Flask is exposed on **port 5000**.
 http://localhost:5000/index?password=index123
 ```
 
-This reads all hadiths from MySQL and builds both the lexical and mxbai indexes. Embedding ~48k English hadiths takes a few minutes.
+This reads all hadiths from MySQL and builds both the lexical and mxbai indexes. Embedding ~48k English hadiths takes ~9 min via the HF Dedicated Endpoint (or considerably longer through Ollama if no remote endpoint is configured).
 
 To index only one at a time:
 ```
@@ -146,11 +149,13 @@ http://<server>:7650/index/status
 
 ## Embedding model
 
-| Key | Model | Served by | Dimensions |
-|---|---|---|---|
-| `mxbai` | mxbai-embed-large | Ollama (host) | 1024 |
+| Key | Model | Query-time | Index-time | Dimensions |
+|---|---|---|---|---|
+| `mxbai` | mxbai-embed-large | Ollama (host) | HF Dedicated Endpoint (optional) → else Ollama | 1024 |
 
-mxbai runs via **Ollama on the host machine**, not inside Docker. The container reaches it at `http://host.docker.internal:11434`. Ollama exposes an OpenAI-compatible API, which ES 8.16's inference endpoint uses to embed queries and index documents.
+Queries are always embedded via **Ollama on the host machine** (not inside Docker) — the container reaches it at `http://host.docker.internal:11434` via ES 8.16's OpenAI-compatible inference endpoint. Index-time embedding is offloaded to a remote TEI endpoint when `HUGGING_FACE_KEY` + `HF_DEDICATED_URL` are set: the indexer fetches vectors over HTTP and ships them inline with the bulk payload (ES's `semantic_text` accepts pre-populated chunks and skips its own inference call). Vectors from TEI and Ollama for the same model are bit-compatible (cosine ≈ 0.9999), so queries can match docs embedded by either side.
+
+Per-run tuning via env vars: `HF_DEDICATED_CONCURRENCY` (default 4), `HF_DEDICATED_BATCH_SIZE` (default 16, must keep `batch × max_input_length ≤ TEI's max_batch_tokens`), `HF_DEDICATED_RPM` (default -1, disabled).
 
 ### Adding a model
 
