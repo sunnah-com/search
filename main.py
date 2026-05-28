@@ -655,8 +655,7 @@ def index():
     # have to handle them — TEI rejects empty inputs, ES wastes an _id storing
     # them, and a hadith with no text can't match any query anyway.
     #
-    # Each SELECT's columns ARE a language's reconstruction payload (`dict(r)`
-    # below) — the names match the website's EnglishHadith/ArabicHadith model
+    # Each SELECT's columns ARE a language's reconstruction payload  — the names match the website's EnglishHadith/ArabicHadith model
     # properties, so keep them in sync. bookID is DECIMAL — cast to CHAR so it
     # JSON-serializes and matches how the website keys books ("1.0").
     cursor.execute(
@@ -688,7 +687,7 @@ def index():
         if hadith["matchingEnglishURN"] == 0:
             arabicOnlyHadiths.append(doc)
         else:
-            arabicByMatchingEnglish[r["matchingEnglishURN"]] = ar_obj
+            arabicByMatchingEnglish[hadith["matchingEnglishURN"]] = ar_obj
 
     cursor.execute(
         """SELECT englishURN, collection, volumeNumber, bookNumber, hadithNumber,
@@ -711,7 +710,7 @@ def index():
         }
         # Fold in the matching Arabic side → one bilingual doc. Arabic
         # hadithNumber stays top-level to preserve search ranking (hadithNumber^2).
-        ar_obj = arabicByMatchingEnglish.get(r["englishURN"])
+        ar_obj = arabicByMatchingEnglish.get(hadith["englishURN"])
         if ar_obj is not None:
             doc["arabicText"] = ar_obj["hadithText"]
             doc["hadithNumber"] = ar_obj["hadithNumber"]
