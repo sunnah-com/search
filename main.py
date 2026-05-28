@@ -6,7 +6,7 @@ import time
 import urllib.request
 import urllib.error
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, g
 from werkzeug.exceptions import HTTPException
 import pymysql
@@ -92,7 +92,7 @@ _HF_DEDICATED_URL = os.environ.get("HF_DEDICATED_URL")  # e.g. https://<id>.endp
 _MXBAI_DIMS = 1024
 
 
-def _build_remote_inference():
+def _build_remote_mxbai_inference():
     """Index-time embedding via a HuggingFace Inference Endpoint running TEI.
 
     The endpoint exposes an OpenAI-compatible /v1/embeddings route that returns
@@ -130,7 +130,7 @@ EMBEDDING_MODELS = {
         # inline in the bulk payload (semantic_text accepts pre-populated chunks
         # and skips its own inference call). Query time always goes through the
         # ES inference endpoint above (local Ollama).
-        "remote_inference": _build_remote_inference(),
+        "remote_inference": _build_remote_mxbai_inference(),
     },
 }
 
@@ -300,27 +300,39 @@ def _embed_via_remote(model, texts):
     out = [None] * len(batches)
     with ThreadPoolExecutor(max_workers=_REMOTE_EMBED_CONCURRENCY) as ex:
         future_to_idx = {ex.submit(_embed_batch, b): i for i, b in enumerate(batches)}
-        for f in future_to_idx:
+        # as_completed yields futures in completion order, so a single slow batch
+        # doesn't idle workers that finished after it but were submitted earlier.
+        for f in as_completed(future_to_idx):
             out[future_to_idx[f]] = f.result()
     return [v for batch in out for v in batch]
 
 
 def _attach_semantic_field(paired):
-    """Attach SEMANTIC_FIELD as plain text. ES auto-embeds via the bound inference
-    endpoint (Ollama) at bulk time — unless _rewrite_inline_chunks is called first
-    to pre-populate the field with vectors from a remote inference provider.
+    """Attach SEMANTIC_FIELD as plain text on each doc.
 
-    Docs with empty text get no SEMANTIC_FIELD at all — both Ollama and TEI
-    reject empty inputs, and a doc with no hadithText can't be searched
-    semantically anyway.
+    ES then auto-embeds via the bound inference endpoint (Ollama) at bulk time,
+    unless _rewrite_inline_chunks is called first to pre-populate the field
+    with vectors from a remote provider.
+
+    Empty/whitespace-only text is filtered at the SQL source, so by the time we
+    get here every paired text is a non-empty string.
     """
-    out = []
-    for doc, text in paired:
-        if text and text.strip():
-            out.append({**doc, SEMANTIC_FIELD: text})
-        else:
-            out.append(dict(doc))
-    return out
+    return [{**doc, SEMANTIC_FIELD: text} for doc, text in paired]
+
+
+def _inline_chunk_doc(doc, text, vec, inference_id, model_settings):
+    """Build the doc shape ES's semantic_text accepts when bypassing inference."""
+    return {
+        **doc,
+        SEMANTIC_FIELD: {
+            "text": text,
+            "inference": {
+                "inference_id": inference_id,
+                "model_settings": model_settings,
+                "chunks": [{"text": text, "embeddings": vec}],
+            },
+        },
+    }
 
 
 def _rewrite_inline_chunks(docs, model):
@@ -331,16 +343,8 @@ def _rewrite_inline_chunks(docs, model):
     don't burn API quota embedding unchanged docs.
     """
     remote = model["remote_inference"]
-    # TEI rejects whole batches that contain any empty string ("`inputs` cannot
-    # be empty"). Filter to non-empty strings here; docs with empty text keep
-    # their empty SEMANTIC_FIELD and aren't indexed semantically.
-    embeddable = [(i, doc[SEMANTIC_FIELD]) for i, doc in enumerate(docs)
-                  if isinstance(doc.get(SEMANTIC_FIELD), str) and doc[SEMANTIC_FIELD].strip()]
-    if not embeddable:
-        return docs
+    texts = [doc[SEMANTIC_FIELD] for doc in docs]
 
-    indices = [i for i, _ in embeddable]
-    texts = [t for _, t in embeddable]
     access_log.info(
         "remote_embed_start",
         extra={"model": model["label"], "doc_count": len(texts),
@@ -362,20 +366,8 @@ def _rewrite_inline_chunks(docs, model):
         "similarity": "cosine",
         "element_type": "float",
     }
-    for idx, vec in zip(indices, vectors):
-        text = docs[idx][SEMANTIC_FIELD]
-        docs[idx] = {
-            **docs[idx],
-            SEMANTIC_FIELD: {
-                "text": text,
-                "inference": {
-                    "inference_id": model["inference_id"],
-                    "model_settings": model_settings,
-                    "chunks": [{"text": text, "embeddings": vec}],
-                },
-            },
-        }
-    return docs
+    return [_inline_chunk_doc(doc, text, vec, model["inference_id"], model_settings)
+            for doc, text, vec in zip(docs, texts, vectors)]
 
 
 def _bulk_index(actions, index, timeout=None):
@@ -565,9 +557,13 @@ def index():
         database=os.environ.get("MYSQL_DATABASE"),
     )
     cursor = connection.cursor(pymysql.cursors.DictCursor)
+    # Filter out empty rows at the source so the rest of the pipeline doesn't
+    # have to handle them — TEI rejects empty inputs, ES wastes an _id storing
+    # them, and a hadith with no text can't match any query anyway.
     cursor.execute(
         """SELECT arabicURN as urn, collection, hadithNumber, hadithText as arabicText,
-                    matchingEnglishURN, "ar" as lang, grade1 as grade FROM ArabicHadithTable"""
+                    matchingEnglishURN, "ar" as lang, grade1 as grade FROM ArabicHadithTable
+                  WHERE hadithText IS NOT NULL AND TRIM(hadithText) != ''"""
     )
     arabicHadiths = cursor.fetchall()
 
@@ -580,7 +576,8 @@ def index():
 
     cursor.execute(
         """SELECT englishURN as urn, collection, hadithText,
-                    matchingArabicURN, "en" as lang, grade1 as grade FROM EnglishHadithTable"""
+                    matchingArabicURN, "en" as lang, grade1 as grade FROM EnglishHadithTable
+                  WHERE hadithText IS NOT NULL AND TRIM(hadithText) != ''"""
     )
     englishHadiths = cursor.fetchall()
     for h in englishHadiths:
