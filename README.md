@@ -92,7 +92,7 @@ semantic build is running or was interrupted.
 ## Production deployment
 
 Production uses `docker-compose.prod.yml` directly. Key differences from local:
-- **No MySQL service** — connects to the existing external DB via env vars
+- **No MySQL services** — connects to the existing external hadith DB and the searchdb (shadow-sampling metrics) via env vars
 - **uwsgi** instead of Flask dev server, exposed on **port 7650**
 - **Persistent ES data** in a named Docker volume (`es-data`)
 - **Explicit ES JVM memory limits** (`-Xms600m -Xmx1g`)
@@ -115,6 +115,14 @@ ELASTIC_PASSWORD=<strong password>
 INDEXING_PASSWORD=<strong password>
 
 SEMANTIC_ENABLED=true
+
+# searchdb (shadow sampling) — point at the externally-managed metrics DB
+searchdb_host=<prod searchdb host>
+searchdb_name=<db>
+searchdb_username=<user>
+searchdb_password=<password>
+# 0 keeps shadow sampling off; raise to start sampling (see "Shadow sampling")
+SEARCH_METRICS_SAMPLE_PERCENT=0
 ```
 
 ### 2. Ollama on Linux
@@ -169,6 +177,40 @@ Per-run tuning via env vars: `HF_DEDICATED_CONCURRENCY` (default 4), `HF_DEDICAT
 5. If it should be the default for `/search?mode=semantic` without a `&model=` param, point `DEFAULT_SEMANTIC_MODEL` at the new key.
 
 `SEMANTIC_ENABLED` is a single global toggle — you don't add a per-model env var.
+
+---
+
+## Shadow sampling (semantic rollout)
+
+To roll semantic search out safely, the service can **shadow-sample** live traffic:
+on a random fraction of lexical-served `/search` queries it also runs the semantic
+query in a background thread and records both sides — results and query timings —
+to a `search_metrics` table in a separate **searchdb** (MySQL). The user always
+gets the lexical response, unchanged and undelayed; the semantic run is fire-and-forget.
+
+This produces an apples-to-apples dataset (same real queries, both engines) to
+compare result quality and latency before flipping semantic on for everyone.
+
+Enable it by setting the sample percent (0 = off, the default):
+
+```env
+SEARCH_METRICS_SAMPLE_PERCENT=5     # shadow 5% of lexical queries
+```
+
+Requires `SEMANTIC_ENABLED=true`, the default semantic model indexed, and a
+reachable searchdb (`searchdb_host` / `searchdb_name` / `searchdb_username` /
+`searchdb_password`). Optional knobs: `SEARCH_METRICS_WORKERS` (background pool
+size, default 2) and `SEARCH_METRICS_MAX_INFLIGHT` (backlog cap before samples
+are dropped under load, default 50).
+
+`search_metrics` columns: `query`, `lexical_results` / `semantic_results` (full
+ES response bodies as JSON), `lexical_query_time_ms` / `semantic_query_time_ms`,
+`semantic_model_name`, and `routing_decision` (reserved for a future query router).
+
+Locally, the `searchdb` service in `docker-compose.yml` provisions this DB and
+creates the table from `searchdb/01-search_metrics.sql` on first start — no setup
+needed beyond `docker compose up`. In prod, searchdb is an externally-managed DB
+(like the hadith MySQL); just point the `searchdb_*` env vars at it.
 
 ---
 
