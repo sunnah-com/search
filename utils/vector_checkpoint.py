@@ -19,6 +19,30 @@ import json
 import os
 import threading
 
+# Checkpoint files are named "{index}.jsonl" under the checkpoint dir. Defined
+# here so inspectors (e.g. /index/status) discover them without reimplementing
+# the on-disk naming.
+CHECKPOINT_SUFFIX = ".jsonl"
+
+
+def checkpoint_path(directory, index_name):
+    return os.path.join(directory, f"{index_name}{CHECKPOINT_SUFFIX}")
+
+
+def list_checkpoints(directory):
+    """Yield (index_name, path) for each checkpoint file in `directory`.
+
+    Yields nothing if the directory is missing. Encapsulates the file naming so
+    callers can inspect checkpoints without knowing the on-disk format.
+    """
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return
+    for name in names:
+        if name.endswith(CHECKPOINT_SUFFIX):
+            yield name[: -len(CHECKPOINT_SUFFIX)], os.path.join(directory, name)
+
 
 class VectorCheckpoint:
     """Append-only {text_hash: vector} store backed by a JSONL file.

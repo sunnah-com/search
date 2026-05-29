@@ -20,7 +20,12 @@ from pythonjsonlogger import jsonlogger
 
 from utils.rate_limiter import RateLimiter
 from utils.shortcode_pattern import SHORTCODE_PATTERN
-from utils.vector_checkpoint import VectorCheckpoint, NullCheckpoint
+from utils.vector_checkpoint import (
+    VectorCheckpoint,
+    NullCheckpoint,
+    checkpoint_path,
+    list_checkpoints,
+)
 
 load_dotenv(".env.local")
 
@@ -297,7 +302,7 @@ def _open_checkpoint(model):
     """
     if not (_EMBED_CHECKPOINT_ENABLED and model and model.get("remote_inference")):
         return NullCheckpoint()
-    path = os.path.join(_EMBED_CHECKPOINT_DIR, f"{model['index']}.jsonl")
+    path = checkpoint_path(_EMBED_CHECKPOINT_DIR, model["index"])
     try:
         cp = VectorCheckpoint(path)
     except OSError as e:
@@ -971,16 +976,116 @@ def index():
     return jsonify(results)
 
 
+def _index_language_counts(index):
+    """Total + per-language doc counts for a live index/alias.
+
+    `lang` is stored but not indexed, so we can't aggregate on it. Instead break
+    down by which text field is present: a doc with hadithText carries an English
+    side, one with arabicText carries an Arabic side. A bilingual doc has both
+    and is counted under each — matching how it's actually searchable in either
+    language, and why "lexical" legitimately reports both English and Arabic.
+    """
+    r = es_client.search(
+        index=index,
+        size=0,
+        track_total_hits=True,
+        aggregations={
+            "english": {"filter": {"exists": {"field": "hadithText"}}},
+            "arabic": {"filter": {"exists": {"field": "arabicText"}}},
+        },
+    )
+    return {
+        "count": r["hits"]["total"]["value"],
+        "english": r["aggregations"]["english"]["doc_count"],
+        "arabic": r["aggregations"]["arabic"]["doc_count"],
+    }
+
+
+def _temp_index_progress(index):
+    """Live doc count + age of an in-flight `{base}-{ns}` rebuild index."""
+    info = {"index": index}
+    try:
+        info["count"] = es_client.count(index=index)["count"]
+        settings = es_client.indices.get_settings(index=index)
+        created_ms = int(settings[index]["settings"]["index"]["creation_date"])
+        info["age_seconds"] = round(time.time() - created_ms / 1000, 1)
+    except Exception as e:  # index can vanish mid-call once a rebuild swaps in
+        info["error"] = str(e)
+    return info
+
+
+def _index_build_status(base):
+    """Status for one logical index, including any rebuild in progress.
+
+    A rebuild bulk-loads a fresh `{base}-{ns}` index and only flips the `{base}`
+    alias onto it at the very end (see _rebuild_index). So a concrete `{base}-*`
+    index the alias doesn't yet point to is a build in progress (or an abandoned
+    one) — surfaced under "building" with its climbing doc count.
+
+    One `_alias` lookup over `{base}*` resolves both the live indices (those the
+    `base` alias serves) and the in-flight ones in a single round-trip.
+    """
+    try:
+        resolved = es_client.indices.get_alias(index=f"{base}*")
+    except NotFoundError:
+        resolved = {}
+    live_indices = {idx for idx, meta in resolved.items() if base in meta["aliases"]}
+    if not live_indices and base in resolved:
+        live_indices = {base}  # plain index, not yet alias-backed
+    building_indices = sorted(
+        idx
+        for idx in resolved
+        if idx.startswith(f"{base}-") and idx not in live_indices
+    )
+
+    out = {"index": base, "indexed": bool(live_indices)}
+    if live_indices:
+        out["live_index"] = sorted(live_indices)
+        out["incremental"] = _index_is_incremental(base)
+        out.update(_index_language_counts(base))
+
+    building = [_temp_index_progress(idx) for idx in building_indices]
+    if building:
+        out["building"] = building
+    return out
+
+
+def _checkpoint_status():
+    """Resume caches on disk → an embed pass is in progress or was interrupted.
+
+    A checkpoint file only exists between the start of a semantic build and its
+    success (it's discarded on completion). During the embed phase the temp ES
+    index exists but holds 0 docs, so the checkpoint's growing size is the
+    progress signal; a stale mtime means a build died and the next run resumes.
+    """
+    out = []
+    for index_name, path in list_checkpoints(_EMBED_CHECKPOINT_DIR):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        out.append(
+            {
+                "index": index_name,
+                "size_bytes": st.st_size,
+                "idle_seconds": round(time.time() - st.st_mtime, 1),
+            }
+        )
+    return out
+
+
 @app.route("/index/status", methods=["GET"])
 def index_status():
-    out = {}
-    for index_name in [LEXICAL_INDEX] + [m["index"] for m in EMBEDDING_MODELS.values()]:
-        try:
-            r = es_client.search(index=index_name, size=0, track_total_hits=True)
-            out[index_name] = {"indexed": True, "count": r["hits"]["total"]["value"]}
-        except NotFoundError:
-            out[index_name] = {"indexed": False}
-    return jsonify(out)
+    indexes = {"lexical": _index_build_status(LEXICAL_INDEX)}
+    for key, model in EMBEDDING_MODELS.items():
+        indexes[key] = _index_build_status(model["index"])
+    return jsonify(
+        {
+            "semantic_enabled": SEMANTIC_ENABLED,
+            "indexes": indexes,
+            "checkpoints": _checkpoint_status(),
+        }
+    )
 
 
 # ── Search helpers ────────────────────────────────────────────────────────────

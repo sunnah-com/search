@@ -76,10 +76,16 @@ To force a full rebuild instead of incremental:
 http://localhost:5000/index?password=index123&rebuild=true
 ```
 
-Check index status (doc counts):
+Check index status:
 ```
 http://localhost:5000/index/status
 ```
+Reports, per logical index (`lexical` + each semantic model): the live ES index
+behind the alias, whether it supports incremental updates, total docs and an
+English/Arabic breakdown, and any in-progress rebuild (a `{index}-{ns}` index
+the alias hasn't swapped onto yet) with its climbing doc count. The top-level
+`checkpoints` list shows embed-resume caches still on disk — present only while a
+semantic build is running or was interrupted.
 
 ---
 
@@ -189,7 +195,7 @@ Mode is passed as a query parameter:
 |---|---|
 | `GET /<language>/search?q=...` | Main search endpoint (consumed by PHP website) |
 | `GET /index?password=...` | Build/rebuild ES indexes from MySQL |
-| `GET /index/status` | Doc counts for all indexes |
+| `GET /index/status` | Per-index doc counts (English/Arabic), live index, and in-progress builds |
 
 ---
 
