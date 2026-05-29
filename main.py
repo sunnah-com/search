@@ -1,7 +1,9 @@
 import hashlib
 import logging
+import random
 import socket
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -84,6 +86,14 @@ def _is_truthy(value):
     return (value or "").lower() in ("1", "true", "yes")
 
 
+def _int_env(name, default):
+    """Parse an int env var, falling back to `default` on missing/garbage."""
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 # Pure lexical index — no embeddings, fast to rebuild.
 LEXICAL_INDEX = "english-lexical"
 
@@ -152,6 +162,39 @@ _ENABLED_MODELS = EMBEDDING_MODELS if SEMANTIC_ENABLED else {}
 # Set explicitly rather than reading the first dict key, so adding another
 # semantic model doesn't accidentally change which one is the default.
 DEFAULT_SEMANTIC_MODEL = "mxbai"
+
+
+# ── Shadow sampling ─────────────────────────────────────────────────────────
+# Safe semantic rollout: on a random fraction of lexical-served queries, also
+# run the semantic query in the background and persist both results + timings to
+# the `search_metrics` table in a separate searchdb, for offline comparison.
+# The served response is always the lexical one and is never delayed by this.
+#
+# Percent of lexical-served queries to shadow (0–100). 0 (or unset) = disabled,
+# so the feature stays dark until explicitly turned on in prod.
+SEARCH_METRICS_SAMPLE_PERCENT = _int_env("SEARCH_METRICS_SAMPLE_PERCENT", 0)
+# Background worker pool size and a backlog cap: if semantic latency spikes, drop
+# samples rather than let the queue (and memory) grow without bound. Sampling is
+# best-effort telemetry — losing a few rows under load is fine.
+_SHADOW_WORKERS = _int_env("SEARCH_METRICS_WORKERS", 2)
+_SHADOW_MAX_INFLIGHT = _int_env("SEARCH_METRICS_MAX_INFLIGHT", 50)
+
+# Separate searchdb (MySQL) holding `search_metrics`. Lowercase env var names
+# match what's provisioned in prod (see .env.sample).
+_SEARCHDB_CONFIG = {
+    "host": os.environ.get("searchdb_host"),
+    "user": os.environ.get("searchdb_username"),
+    "password": os.environ.get("searchdb_password"),
+    "database": os.environ.get("searchdb_name"),
+}
+
+_SHADOW_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_SHADOW_WORKERS, thread_name_prefix="shadow"
+)
+# Bound the in-flight backlog: a non-blocking acquire fails — and we drop the
+# sample — once _SHADOW_MAX_INFLIGHT tasks are outstanding, instead of letting
+# the executor queue (and memory) grow without bound under load.
+_shadow_slots = threading.BoundedSemaphore(_SHADOW_MAX_INFLIGHT)
 
 # Bulk-indexing timeouts. Semantic bulk can be slow because ES embeds each
 # doc against the inference endpoint (Ollama) unless we shipped inline chunks;
@@ -1209,6 +1252,7 @@ def search(language):
         "highlight": {"number_of_fragments": 0, "fields": {"*": {}}},
         "suggest": get_suggest_block(query),
     }
+    lexical_start = time.perf_counter()
     try:
         try:
             result = es_client.search(query=build_lexical("query_string"), **kwargs)
@@ -1218,22 +1262,147 @@ def search(language):
             )
     except BadRequestError as e:
         return malformed_query_response(e)
+    lexical_ms = (time.perf_counter() - lexical_start) * 1000
+
+    _maybe_shadow_sample(
+        query,
+        filters,
+        request.args.get("from", 0),
+        request.args.get("size", 10),
+        result.body,
+        lexical_ms,
+    )
     return jsonify(result.body)
+
+
+def _execute_semantic_search(search_index, query, filters, from_, size):
+    """Run the semantic ES query. Shared by the request route and the shadow
+    sampler so the query shape (timeout, source excludes, suggest) lives once."""
+    return es_client.options(request_timeout=130).search(
+        index=search_index,
+        from_=int(from_),
+        size=int(size),
+        query=build_semantic_query(query, filters),
+        _source={"excludes": [SEMANTIC_FIELD]},
+        suggest=get_suggest_block(query),
+    )
 
 
 def _semantic_search(search_index, query, filters):
     try:
-        result = es_client.options(request_timeout=130).search(
-            index=search_index,
-            from_=int(request.args.get("from", 0)),
-            size=int(request.args.get("size", 10)),
-            query=build_semantic_query(query, filters),
-            _source={"excludes": [SEMANTIC_FIELD]},
-            suggest=get_suggest_block(query),
+        result = _execute_semantic_search(
+            search_index,
+            query,
+            filters,
+            request.args.get("from", 0),
+            request.args.get("size", 10),
         )
     except BadRequestError as e:
         return malformed_query_response(e)
     return jsonify(result.body)
+
+
+# ── Shadow sampling ─────────────────────────────────────────────────────────
+
+
+def _shadow_sampling_enabled():
+    """True only when everything sampling needs is configured: a non-zero rate,
+    semantic search enabled with at least one model, and searchdb credentials."""
+    return (
+        SEARCH_METRICS_SAMPLE_PERCENT > 0
+        and SEMANTIC_ENABLED
+        and bool(_ENABLED_MODELS)
+        and all(_SEARCHDB_CONFIG.values())
+    )
+
+
+def _run_semantic_shadow(search_index, query, filters, from_, size):
+    """Run the semantic query for comparison. Returns (result_body, elapsed_ms).
+
+    Runs the same query as the request route (via _execute_semantic_search) but
+    is request-context-free — it runs on a background thread, where Flask's
+    `request`/`g` are gone, so all inputs are passed in.
+    """
+    t0 = time.perf_counter()
+    result = _execute_semantic_search(search_index, query, filters, from_, size)
+    return result.body, (time.perf_counter() - t0) * 1000
+
+
+def _persist_search_metrics(
+    query,
+    lexical_results,
+    lexical_ms,
+    semantic_results,
+    semantic_ms,
+    model_name,
+    routing_decision=None,
+):
+    """Insert one row into search_metrics. Opens a fresh connection per write —
+    sampled volume is low, so a pool isn't worth the added lifecycle."""
+    conn = pymysql.connect(charset="utf8mb4", **_SEARCHDB_CONFIG)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO search_metrics
+                       (query, lexical_results, lexical_query_time_ms,
+                        semantic_results, semantic_query_time_ms,
+                        semantic_model_name, routing_decision)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    query,
+                    json.dumps(lexical_results, ensure_ascii=False, default=str),
+                    round(lexical_ms, 3),
+                    json.dumps(semantic_results, ensure_ascii=False, default=str),
+                    round(semantic_ms, 3),
+                    model_name,
+                    routing_decision,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _shadow_sample_task(query, filters, from_, size, lexical_body, lexical_ms):
+    """Background task: run the semantic side and persist both results. Swallows
+    every error — shadow telemetry must never affect the served request, and it
+    already returned by the time this runs."""
+    try:
+        model = _ENABLED_MODELS[DEFAULT_SEMANTIC_MODEL]
+        semantic_body, semantic_ms = _run_semantic_shadow(
+            model["index"], query, filters, from_, size
+        )
+        _persist_search_metrics(
+            query,
+            lexical_body,
+            lexical_ms,
+            semantic_body,
+            semantic_ms,
+            model["label"],
+        )
+    except Exception:
+        access_log.exception("shadow_sample_failed", extra={"query": query})
+    finally:
+        _shadow_slots.release()
+
+
+def _maybe_shadow_sample(query, filters, from_, size, lexical_body, lexical_ms):
+    """Roll the dice on a lexical-served query and, if it wins, hand the semantic
+    comparison off to the background pool. Returns immediately; never raises."""
+    if not query or not _shadow_sampling_enabled():
+        return
+    if random.randint(1, 100) > SEARCH_METRICS_SAMPLE_PERCENT:
+        return
+    if not _shadow_slots.acquire(blocking=False):
+        access_log.warning("shadow_sample_dropped")
+        return
+    try:
+        _SHADOW_EXECUTOR.submit(
+            _shadow_sample_task, query, filters, from_, size, lexical_body, lexical_ms
+        )
+    except RuntimeError:
+        # Executor shutting down (e.g. interpreter exit) — release the slot.
+        _shadow_slots.release()
 
 
 if __name__ == "__main__":
