@@ -101,11 +101,13 @@ LEXICAL_INDEX = "english-lexical"
 # The semantic field is always called "semantic_text" inside each model's index.
 SEMANTIC_FIELD = "semantic_text"
 
-# Clip query text before embedding: Ollama doesn't truncate, so over-long input
-# overflows the model's context window (400) or burns CPU and stalls the serial
-# embed queue. Real queries are a phrase or two; 1000 chars only clips garbage.
+# Clip the incoming query before it hits either search path. Semantic needs it
+# because Ollama doesn't truncate, so over-long input overflows the model's
+# context window (400) or burns CPU and stalls the serial embed queue; lexical
+# benefits too, since huge query_strings are pure ES load with no real intent
+# behind them. Real queries are a phrase or two; 1000 chars only clips garbage.
 # Env-tunable — tighten if context-length 400s reappear (e.g. dense scripts).
-SEMANTIC_QUERY_MAX_CHARS = _int_env("SEMANTIC_QUERY_MAX_CHARS", 1000)
+QUERY_MAX_CHARS = _int_env("QUERY_MAX_CHARS", 1000)
 
 _OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://host.docker.internal:11434")
 _HUGGING_FACE_KEY = os.environ.get("HUGGING_FACE_KEY")
@@ -1162,30 +1164,24 @@ def get_suggest_block(query):
     }
 
 
-def _truncate_for_embedding(query):
-    """Clip query text to SEMANTIC_QUERY_MAX_CHARS before embedding. Runs in both
-    request and shadow-thread contexts, so it touches no request-scoped state."""
-    if query is None or len(query) <= SEMANTIC_QUERY_MAX_CHARS:
+def _truncate_query(query):
+    """Clip query text to QUERY_MAX_CHARS. Applied once when the request query is
+    read, so it covers both the lexical and semantic paths (and the shadow
+    sampler, which is handed the already-truncated query)."""
+    if query is None or len(query) <= QUERY_MAX_CHARS:
         return query
     access_log.warning(
-        "semantic_query_truncated",
-        extra={"original_len": len(query), "max_chars": SEMANTIC_QUERY_MAX_CHARS},
+        "query_truncated",
+        extra={"original_len": len(query), "max_chars": QUERY_MAX_CHARS},
     )
-    return query[:SEMANTIC_QUERY_MAX_CHARS]
+    return query[:QUERY_MAX_CHARS]
 
 
 def build_semantic_query(query, filter_clauses):
     return {
         "bool": {
             "filter": filter_clauses,
-            "must": [
-                {
-                    "semantic": {
-                        "field": SEMANTIC_FIELD,
-                        "query": _truncate_for_embedding(query),
-                    }
-                }
-            ],
+            "must": [{"semantic": {"field": SEMANTIC_FIELD, "query": query}}],
         }
     }
 
@@ -1230,7 +1226,7 @@ def malformed_query_response(exc):
 
 @app.route("/<language>/search", methods=["GET"])
 def search(language):
-    query = request.args.get("q")
+    query = _truncate_query(request.args.get("q"))
     filters = get_filter_from_args(request.args)
     mode = _resolve_mode(request.args)
 
