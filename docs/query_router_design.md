@@ -21,11 +21,11 @@ query string
     │       → route: lexical  │  variant: reference
     │
     ├─ contains AND / OR / NOT (uppercase)?
-    │       → route: lexical  │  variant: None  (standard BM25)
+    │       → route: lexical  │  variant: —  (standard BM25)
     │
-    └─ otherwise
-            → route: mode (whatever ?mode= says, default lexical)
-                    variant: None
+    └─ otherwise (passthrough to ?mode=)
+            → route: lexical   │  variant: —  (default, or ?mode=lexical)
+              route: semantic  │  variant: —  (if ?mode=semantic)
 ```
 
 ### Detection code
