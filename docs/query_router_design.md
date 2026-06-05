@@ -64,7 +64,8 @@ semantic search ignores entirely (it just embeds the words and discards the logi
 **Triggered by:** Query wrapped in double quotes: `"actions are by intention"`.
 
 **ES query:** `match_phrase` on both `hadithText` and `arabicText` (minimum one
-must match). Requires all tokens to appear in order with no gaps.
+must match), wrapped in `function_score` for collection boosts. Requires all
+tokens to appear in order with no gaps.
 
 Example for query `"actions are by intention"` on `/english/search`:
 
@@ -72,13 +73,25 @@ Example for query `"actions are by intention"` on `/english/search`:
 GET /english-mxbai/_search
 {
   "query": {
-    "bool": {
-      "filter": [{"exists": {"field": "hadithText"}}],
-      "should": [
-        {"match_phrase": {"hadithText": "actions are by intention"}},
-        {"match_phrase": {"arabicText": "actions are by intention"}}
+    "function_score": {
+      "query": {
+        "bool": {
+          "filter": [{"exists": {"field": "hadithText"}}],
+          "should": [
+            {"match_phrase": {"hadithText": "actions are by intention"}},
+            {"match_phrase": {"arabicText": "actions are by intention"}}
+          ],
+          "minimum_should_match": 1
+        }
+      },
+      "functions": [
+        {"filter": {"term": {"collection": "bukhari"}},         "weight": 3.5},
+        {"filter": {"term": {"collection": "muslim"}},          "weight": 3.5},
+        {"filter": {"term": {"collection": "forty"}},           "weight": 3.3},
+        {"filter": {"term": {"collection": "riyadussalihin"}},  "weight": 3.3}
       ],
-      "minimum_should_match": 1
+      "score_mode": "sum",
+      "boost_mode": "sum"
     }
   }
 }

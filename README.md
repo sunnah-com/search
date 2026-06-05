@@ -308,9 +308,9 @@ Every incoming query is classified by `_route_query()` before any ES call. Rules
 
 **`_meta.route`** is present in every response and names the path taken. Facet aggregations (`gradeNorm`, `collection`) and the `isChainRef` exclusion filter are added by downstream branches (corpus-normalization and facets).
 
-### Standard lexical — collection boosts
+### Collection boosts
 
-Standard BM25 queries (`route: lexical`) are wrapped in a `function_score` that adds a flat weight to docs from authoritative collections before the BM25 score is summed:
+All lexical routes (phrase, Arabic BM25, reference, standard BM25) are wrapped in a `function_score` that adds a flat weight to docs from authoritative collections before the score is summed:
 
 | Weight | Collections |
 |---|---|

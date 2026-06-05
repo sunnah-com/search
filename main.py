@@ -852,13 +852,21 @@ def search(language):
             result = es_client.search(
                 index=LEXICAL_INDEX,
                 size=size,
-                query={"bool": {
-                    "filter": filters,
-                    "should": [
-                        {"match_phrase": {"hadithText": phrase}},
-                        {"match_phrase": {"arabicText": phrase}},
+                query={"function_score": {
+                    "query": {"bool": {
+                        "filter": filters,
+                        "should": [
+                            {"match_phrase": {"hadithText": phrase}},
+                            {"match_phrase": {"arabicText": phrase}},
+                        ],
+                        "minimum_should_match": 1,
+                    }},
+                    "functions": [
+                        {"filter": {"term": {"collection": name}}, "weight": w}
+                        for name, w in COLLECTION_BOOSTS
                     ],
-                    "minimum_should_match": 1,
+                    "score_mode": "sum",
+                    "boost_mode": "sum",
                 }},
                 _source={"excludes": [SEMANTIC_FIELD]},
                 highlight={"number_of_fragments": 0, "fields": {"*": {}}},
