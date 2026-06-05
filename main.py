@@ -1,5 +1,6 @@
 import hashlib
 import random
+import re
 import threading
 import time
 import uuid
@@ -80,6 +81,11 @@ es_client = Elasticsearch(
     request_timeout=10,
 )
 
+
+# When enabled, logs one structured entry per query showing the routing
+# decision: route taken, variant, whether the client mode was overridden.
+# Set ROUTER_LOG=true in .env to turn on. Off by default.
+ROUTER_LOG = _is_truthy(os.environ.get("ROUTER_LOG"))
 
 # Shadow-sampling runtime (sizing constants live in config). The executor and
 # backlog semaphore are live objects, so they're built here where the sampler
@@ -511,14 +517,16 @@ def index():
     models_to_index = {k: v for k, v in _ENABLED_MODELS.items() if k in targets}
     for model_key, model in models_to_index.items():
         _ensure_inference_endpoint(model)
+        embed_field = model.get("embed_field", "hadithText")
         if model.get("multilingual"):
             # Full corpus: every Arabic doc embeds Arabic text, every English doc embeds English.
-            en_docs = [(doc, doc["hadithText"]) for doc in englishHadiths]
+            en_docs = [(doc, doc.get(embed_field) or doc["hadithText"]) for doc in englishHadiths]
             ar_docs = [(doc, doc["arabicText"]) for doc in arabicHadiths]
             paired = en_docs + ar_docs
         else:
-            # English-only — replicates colleague's original PR approach.
-            paired = [(doc, doc["hadithText"]) for doc in englishHadiths]
+            # embed_field controls which text the semantic vector is derived from.
+            # Default: hadithText (full text). Alternatives: englishMatn (isnad-stripped body).
+            paired = [(doc, doc.get(embed_field) or doc["hadithText"]) for doc in englishHadiths]
 
         model_docs = _attach_semantic_field(paired, model)
         results[model_key] = _index_one(
@@ -697,6 +705,47 @@ def build_semantic_query(query, filter_clauses):
     }
 
 
+_ARABIC_RE = re.compile(r"[؀-ۿ]")
+# Ends with a number (with or without preceding text) — "bukhari 1", "abu dawud 200", "5", "42".
+# Forces lexical: semantic returns 0/9 correct for reference-style lookups, and a bare
+# number has no semantic content worth embedding.
+_REF_RE = re.compile(r"(^|\s)\d+[a-z]?\s*$", re.IGNORECASE)
+# Explicit boolean operators in ES query_string syntax.
+# Semantic embeds AND/OR/NOT as plain text and ignores the logic — keep these on BM25.
+_BOOL_RE = re.compile(r"\b(AND|OR|NOT)\b")
+
+
+def _route_query(query, mode):
+    """Classify the query and return (route, variant, extra).
+
+    route   — "lexical" | mode (passes through for semantic/lexical)
+    variant — None | "phrase" | "arabic" | "reference"
+    extra   — always {}
+
+    Rules (applied in order — earlier rules always win):
+      1. Quoted (≥3 chars) → lexical phrase (match_phrase on hadithText + arabicText)
+      2. Any Arabic character → lexical arabic BM25, full corpus
+      3. Ends with a number (or IS a number) → lexical reference, forced off semantic
+      4. Contains AND/OR/NOT → lexical BM25 (operator syntax, semantic ignores these)
+      5. Otherwise → mode as requested (lexical BM25 or semantic)
+    """
+    q = query.strip()
+
+    if len(q) >= 3 and q[0] == '"' and q[-1] == '"':
+        return "lexical", "phrase", {"phrase_text": q[1:-1]}
+
+    if _ARABIC_RE.search(q):
+        return "lexical", "arabic", {}
+
+    if _REF_RE.search(q):
+        return "lexical", "reference", {}
+
+    if _BOOL_RE.search(q):
+        return "lexical", None, {}
+
+    return mode, None, {}
+
+
 def get_filter_from_args(args):
     filters = []
     if collection := args.getlist("collection"):
@@ -740,8 +789,45 @@ def search(language):
     query = _truncate_query(request.args.get("q"))
     filters = get_filter_from_args(request.args)
     mode = _resolve_mode(request.args)
+    size = int(request.args.get("size", 10))
 
-    if mode == SearchMode.SEMANTIC:
+    route, variant, extra = _route_query(query, mode)
+
+    # English route restricts to docs that have hadithText (excludes Arabic-only docs).
+    # lang is stored but not indexed, so we can't term-filter on it — exists on
+    # hadithText is equivalent: English/bilingual docs always have it, Arabic-only never do.
+    # Arabic variant skips this block to search the full corpus.
+    if variant != "arabic" and language == "english":
+        filters = filters + [{"exists": {"field": "hadithText"}}]
+
+    if ROUTER_LOG:
+        if variant == "phrase":
+            log_route = "lexical_phrase"
+        elif variant == "arabic":
+            log_route = "lexical_arabic"
+        elif variant == "reference":
+            log_route = "lexical_reference"
+        elif route == "lexical":
+            log_route = "lexical"
+        else:
+            log_route = str(route)
+
+        # overridden = True when phrase/arabic/reference forced lexical despite mode=semantic
+        overridden = route == "lexical" and mode == SearchMode.SEMANTIC
+        access_log.info(
+            "router_decision",
+            extra={
+                "request_id": getattr(g, "request_id", None),
+                "query": query,
+                "mode_requested": str(mode),
+                "route": log_route,
+                "variant": variant,
+                "overridden": overridden,
+            },
+        )
+
+    # ── Semantic path ──────────────────────────────────────────────────────────
+    if route == SearchMode.SEMANTIC:
         model_key, err = _resolve_model_key(request.args)
         if err:
             return jsonify({"error": err}), 400
@@ -757,7 +843,36 @@ def search(language):
         )
         return _semantic_search(model, query, filters)
 
-    # Lexical path
+    # ── Lexical paths ──────────────────────────────────────────────────────────
+
+    # Phrase search: quoted query → match_phrase on hadithText + arabicText
+    if variant == "phrase":
+        phrase = extra["phrase_text"]
+        try:
+            result = es_client.search(
+                index=LEXICAL_INDEX,
+                size=size,
+                query={"bool": {
+                    "filter": filters,
+                    "should": [
+                        {"match_phrase": {"hadithText": phrase}},
+                        {"match_phrase": {"arabicText": phrase}},
+                    ],
+                    "minimum_should_match": 1,
+                }},
+                _source={"excludes": [SEMANTIC_FIELD]},
+                highlight={"number_of_fragments": 0, "fields": {"*": {}}},
+            )
+        except (BadRequestError, NotFoundError) as e:
+            return malformed_query_response(e)
+        result.body["_meta"] = {"route": "lexical_phrase"}
+        return jsonify(result.body)
+
+    # Arabic BM25 and standard BM25 share the same cross-fields query structure.
+    # arabicText is mapped with custom_arabic — query_string uses each field's own
+    # analyzer automatically, so Arabic tokens get correct morphological analysis
+    # without explicit annotation. The Arabic route skips the lang filter (full corpus)
+    # and sets _meta.route: lexical_arabic; standard BM25 restricts to lang:en.
     fields = ["hadithNumber^2", "hadithText", "arabicText", "collection^2"]
 
     def build_lexical(query_type):
@@ -779,7 +894,7 @@ def search(language):
     kwargs = {
         "index": LEXICAL_INDEX,
         "from_": request.args.get("from", 0),
-        "size": request.args.get("size", 10),
+        "size": size,
         "_source": {"excludes": [SEMANTIC_FIELD]},
         "highlight": {"number_of_fragments": 0, "fields": {"*": {}}},
         "suggest": get_suggest_block(query),
@@ -796,14 +911,20 @@ def search(language):
         return malformed_query_response(e)
     lexical_ms = (time.perf_counter() - lexical_start) * 1000
 
+    if variant == "arabic":
+        result.body["_meta"] = {"route": "lexical_arabic"}
+        return jsonify(result.body)
+
     _maybe_shadow_sample(
         query,
         filters,
         request.args.get("from", 0),
-        request.args.get("size", 10),
+        size,
         result.body,
         lexical_ms,
     )
+    route_tag = "lexical_reference" if variant == "reference" else "lexical"
+    result.body.setdefault("_meta", {})["route"] = route_tag
     return jsonify(result.body)
 
 
@@ -835,6 +956,7 @@ def _semantic_search(model, query, filters):
         )
     except BadRequestError as e:
         return malformed_query_response(e)
+    result.body.setdefault("_meta", {})["route"] = "semantic"
     return jsonify(result.body)
 
 

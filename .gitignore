@@ -2,3 +2,9 @@ db/01-hadithdb.sql
 .env
 __pycache__
 data/
+# Generated embedding checkpoint and cluster output files
+*_done.json
+*_cluster_map.json
+english_matn_map.json
+# Test reports and comparison output — generated files, not source
+test results & reports/
