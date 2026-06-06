@@ -711,13 +711,19 @@ _REF_RE = re.compile(r"(^|\s)\d+[a-z]?\s*$", re.IGNORECASE)
 # Semantic embeds AND/OR/NOT as plain text and ignores the logic — keep these on BM25.
 _BOOL_RE = re.compile(r"\b(AND|OR|NOT)\b")
 
+_LOG_ROUTE_VARIANT = {
+    "phrase": "lexical_phrase",
+    "arabic": "lexical_arabic",
+    "reference": "lexical_reference",
+}
+
 
 def _route_query(query, mode):
-    """Classify the query and return (route, variant, extra).
+    """Classify the query and return (route, variant, phrase_text).
 
-    route   — "lexical" | mode (passes through for semantic/lexical)
-    variant — None | "phrase" | "arabic" | "reference"
-    extra   — always {}
+    route       — "lexical" | mode (passes through for semantic/lexical)
+    variant     — None | "phrase" | "arabic" | "reference"
+    phrase_text — inner text when variant=="phrase", else None
 
     Rules (applied in order — earlier rules always win):
       1. Quoted (≥3 chars) → lexical phrase (match_phrase on hadithText + arabicText)
@@ -729,18 +735,18 @@ def _route_query(query, mode):
     q = query.strip()
 
     if len(q) >= 3 and q[0] == '"' and q[-1] == '"':
-        return "lexical", "phrase", {"phrase_text": q[1:-1]}
+        return "lexical", "phrase", q[1:-1]
 
     if _ARABIC_RE.search(q):
-        return "lexical", "arabic", {}
+        return "lexical", "arabic", None
 
     if _REF_RE.search(q):
-        return "lexical", "reference", {}
+        return "lexical", "reference", None
 
     if _BOOL_RE.search(q):
-        return "lexical", None, {}
+        return "lexical", None, None
 
-    return mode, None, {}
+    return mode, None, None
 
 
 def get_filter_from_args(args):
@@ -788,7 +794,7 @@ def search(language):
     mode = _resolve_mode(request.args)
     size = int(request.args.get("size", 10))
 
-    route, variant, extra = _route_query(query, mode)
+    route, variant, phrase_text = _route_query(query, mode)
 
     # English route restricts to docs that have hadithText (excludes Arabic-only docs).
     # lang is stored but not indexed, so we can't term-filter on it — exists on
@@ -798,17 +804,7 @@ def search(language):
         filters = filters + [{"exists": {"field": "hadithText"}}]
 
     if ROUTER_LOG:
-        if variant == "phrase":
-            log_route = "lexical_phrase"
-        elif variant == "arabic":
-            log_route = "lexical_arabic"
-        elif variant == "reference":
-            log_route = "lexical_reference"
-        elif route == "lexical":
-            log_route = "lexical"
-        else:
-            log_route = str(route)
-
+        log_route = _LOG_ROUTE_VARIANT.get(variant) or ("semantic" if route == SearchMode.SEMANTIC else "lexical")
         # overridden = True when phrase/arabic/reference forced lexical despite mode=semantic
         overridden = route == "lexical" and mode == SearchMode.SEMANTIC
         access_log.info(
@@ -844,17 +840,17 @@ def search(language):
 
     # Phrase search: quoted query → match_phrase on hadithText + arabicText
     if variant == "phrase":
-        phrase = extra["phrase_text"]
         try:
             result = es_client.search(
                 index=LEXICAL_INDEX,
+                from_=int(request.args.get("from", 0)),
                 size=size,
                 query={"function_score": {
                     "query": {"bool": {
                         "filter": filters,
                         "should": [
-                            {"match_phrase": {"hadithText": phrase}},
-                            {"match_phrase": {"arabicText": phrase}},
+                            {"match_phrase": {"hadithText": phrase_text}},
+                            {"match_phrase": {"arabicText": phrase_text}},
                         ],
                         "minimum_should_match": 1,
                     }},
