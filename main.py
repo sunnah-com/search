@@ -517,16 +517,13 @@ def index():
     models_to_index = {k: v for k, v in _ENABLED_MODELS.items() if k in targets}
     for model_key, model in models_to_index.items():
         _ensure_inference_endpoint(model)
-        embed_field = model.get("embed_field", "hadithText")
         if model.get("multilingual"):
             # Full corpus: every Arabic doc embeds Arabic text, every English doc embeds English.
-            en_docs = [(doc, doc.get(embed_field) or doc["hadithText"]) for doc in englishHadiths]
+            en_docs = [(doc, doc["hadithText"]) for doc in englishHadiths]
             ar_docs = [(doc, doc["arabicText"]) for doc in arabicHadiths]
             paired = en_docs + ar_docs
         else:
-            # embed_field controls which text the semantic vector is derived from.
-            # Default: hadithText (full text). Alternatives: englishMatn (isnad-stripped body).
-            paired = [(doc, doc.get(embed_field) or doc["hadithText"]) for doc in englishHadiths]
+            paired = [(doc, doc["hadithText"]) for doc in englishHadiths]
 
         model_docs = _attach_semantic_field(paired, model)
         results[model_key] = _index_one(
