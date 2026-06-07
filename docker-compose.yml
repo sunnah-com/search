@@ -35,11 +35,12 @@ services:
     volumes:
       - .:/code
     ports:
-      - "5000:5000"
+      - "5001:5000"
     env_file:
       - .env
     extra_hosts:
       - "elasticsearch:172.31.250.10"
+      - "host.docker.internal:host-gateway"
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:${ES_STACK_VERSION}
     container_name: elasticsearch
@@ -49,9 +50,12 @@ services:
       - xpack.security.enabled=true
       - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
       - cluster.routing.allocation.disk.threshold_enabled=false
+      - path.repo=/snapshots
     volumes:
       - ./config/synonyms.txt:/usr/share/elasticsearch/config/synonyms.txt
       - es-logs:/usr/share/elasticsearch/logs
+      - es-data:/usr/share/elasticsearch/data
+      - ./data/es-snapshots:/snapshots
     env_file:
       - .env
     networks:
@@ -98,5 +102,6 @@ networks:
 
 volumes:
   es-logs:
+  es-data:
   searchdb-data:
 
