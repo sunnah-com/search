@@ -72,7 +72,8 @@ def _emit_access_log(response):
 
 
 es_auth = ("elastic", os.environ.get("ELASTIC_PASSWORD"))
-es_base_url = f"http://elasticsearch:{os.environ.get('ES_PORT')}"
+_ES_HOST = os.environ.get("ES_HOST", "elasticsearch")
+es_base_url = f"http://{_ES_HOST}:{os.environ.get('ES_PORT')}"
 es_client = Elasticsearch(
     es_base_url,
     http_auth=es_auth,
