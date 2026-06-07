@@ -50,12 +50,9 @@ _HUGGING_FACE_KEY = os.environ.get("HUGGING_FACE_KEY")
 _HF_DEDICATED_URL = os.environ.get(
     "HF_DEDICATED_URL"
 )  # mxbai endpoint, e.g. https://<id>.endpoints.huggingface.cloud
-_HF_DEDICATED_URL_EMBEDDINGGEMMA = os.environ.get(
-    "HF_DEDICATED_URL_EMBEDDINGGEMMA"
-)  # embeddinggemma endpoint
 _HF_DEDICATED_URL_EMBEDDINGGEMMA_QAT = os.environ.get(
     "HF_DEDICATED_URL_EMBEDDINGGEMMA_QAT"
-)  # embeddinggemma QAT (int8) endpoint
+)  # embeddinggemma QAT endpoint (serves the embeddinggemma-qat-q4 model)
 _HF_DEDICATED_URL_MXBAI_XSMALL = os.environ.get(
     "HF_DEDICATED_URL_MXBAI_XSMALL"
 )  # mxbai-embed-xsmall endpoint
@@ -95,27 +92,6 @@ _EMBEDDINGGEMMA_PROMPTS = {
 # Catalog of semantic models. Pure data — no env coupling. Add an entry here
 # to register another model; the on/off switch lives on SEMANTIC_ENABLED above.
 EMBEDDING_MODELS = {
-    "embeddinggemma-qat": {
-        "label": "embeddinggemma-qat",
-        "index": "english-embeddinggemma-qat",
-        "inference_id": "embeddinggemma-qat",
-        "multilingual": False,
-        "dims": 768,  # google/embeddinggemma-300m (QAT int8); used for inline chunks
-        "prompts": _EMBEDDINGGEMMA_PROMPTS,
-        # ES inference endpoint — always bound to local Ollama (query-time embedding).
-        # Ollama exposes an OpenAI-compatible API; ES 8.16 has no native ollama service.
-        "service": "openai",
-        "service_settings": {
-            "api_key": "ollama",  # Ollama doesn't require auth; ES requires a non-empty value
-            "url": f"{_OLLAMA_URL}/v1/embeddings",
-            "model_id": "embeddinggemma:300m-qat-q8_0",
-            "similarity": "cosine",
-        },
-        # Optional remote inference for index time only — see note on mxbai below.
-        "remote_inference": _build_remote_inference(
-            _HF_DEDICATED_URL_EMBEDDINGGEMMA_QAT, "embeddinggemma-qat"
-        ),
-    },
     "embeddinggemma-qat-q4": {
         "label": "embeddinggemma-qat-q4",
         "index": "english-embeddinggemma-qat-q4",
@@ -135,27 +111,6 @@ EMBEDDING_MODELS = {
         # Optional remote inference for index time only — see note on mxbai below.
         "remote_inference": _build_remote_inference(
             _HF_DEDICATED_URL_EMBEDDINGGEMMA_QAT, "embeddinggemma-qat-q4"
-        ),
-    },
-    "embeddinggemma": {
-        "label": "embeddinggemma",
-        "index": "english-embeddinggemma",
-        "inference_id": "embeddinggemma",
-        "multilingual": False,
-        "dims": 768,  # google/embeddinggemma-300m; used for inline chunks
-        "prompts": _EMBEDDINGGEMMA_PROMPTS,
-        # ES inference endpoint — always bound to local Ollama (query-time embedding).
-        # Ollama exposes an OpenAI-compatible API; ES 8.16 has no native ollama service.
-        "service": "openai",
-        "service_settings": {
-            "api_key": "ollama",  # Ollama doesn't require auth; ES requires a non-empty value
-            "url": f"{_OLLAMA_URL}/v1/embeddings",
-            "model_id": "embeddinggemma",
-            "similarity": "cosine",
-        },
-        # Optional remote inference for index time only — see note on mxbai below.
-        "remote_inference": _build_remote_inference(
-            _HF_DEDICATED_URL_EMBEDDINGGEMMA, "embeddinggemma"
         ),
     },
     "mxbai": {
