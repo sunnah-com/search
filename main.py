@@ -718,6 +718,25 @@ _LOG_ROUTE_VARIANT = {
     "reference": "lexical_reference",
 }
 
+# Multi-word collection name aliases → stored identifier.
+# BM25 tokenizes "abu dawud" → ["abu", "dawud"], which won't match the stored
+# token "abudawud". We detect these prefixes and inject a priority boost.
+_COLLECTION_ALIASES = {
+    "abu dawud":       "abudawud",
+    "abu dawood":      "abudawud",
+    "ibn majah":       "ibnmajah",
+    "ibn maja":        "ibnmajah",
+    "nawawi 40":       "nawawi40",
+    "riyad salihin":   "riyadussalihin",
+    "riyadus salihin": "riyadussalihin",
+}
+
+
+def _detect_reference_collection(query: str):
+    """Strip trailing number from a reference query; return stored collection id if alias matches."""
+    prefix = re.sub(r"\s*\d+[a-z]?\s*$", "", query.strip(), flags=re.IGNORECASE).strip().lower()
+    return _COLLECTION_ALIASES.get(prefix)
+
 
 def _route_query(query, mode):
     """Classify the query and return (route, variant, phrase_text).
@@ -877,17 +896,22 @@ def search(language):
     # and sets _meta.route: lexical_arabic; standard BM25 restricts to lang:en.
     fields = ["hadithNumber^2", "hadithText", "arabicText", "collection^2"]
 
+    priority_collection = _detect_reference_collection(query) if variant == "reference" else None
+
     def build_lexical(query_type):
         inner = {"query": query, "fields": fields}
         if query_type == "query_string":
             inner["type"] = "cross_fields"
+        functions = [
+            {"filter": {"term": {"collection": name}}, "weight": w}
+            for name, w in COLLECTION_BOOSTS
+        ]
+        if priority_collection:
+            functions.append({"filter": {"term": {"collection": priority_collection}}, "weight": 100.0})
         return {
             "function_score": {
                 "query": {"bool": {"filter": filters, "must": [{query_type: inner}]}},
-                "functions": [
-                    {"filter": {"term": {"collection": name}}, "weight": w}
-                    for name, w in COLLECTION_BOOSTS
-                ],
+                "functions": functions,
                 "score_mode": "sum",
                 "boost_mode": "sum",
             }
