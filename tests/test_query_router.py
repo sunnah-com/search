@@ -34,6 +34,9 @@ _ARABIC_RE = re.compile(r"[؀-ۿ]")
 # ── Config ─────────────────────────────────────────────────────────────────────
 BASE = os.environ.get("TEST_BASE", "http://localhost:5001")
 LANG = "english"
+# Which model to use for semantic smoke-tests. Defaults to mxbai (always indexed
+# locally). Override with TEST_SEMANTIC_MODEL if testing a different model index.
+SEMANTIC_MODEL = os.environ.get("TEST_SEMANTIC_MODEL", "mxbai")
 
 PASS = "\033[32mPASS\033[0m"
 FAIL = "\033[31mFAIL\033[0m"
@@ -176,7 +179,7 @@ query = "prayer during travel"
 
 try:
     lex = search(query, mode="lexical")
-    sem = search(query, mode="semantic")
+    sem = search(query, mode="semantic", model=SEMANTIC_MODEL)
     lex_ids = [h["_id"] for h in hits(lex)[:10]]
     sem_ids = [h["_id"] for h in hits(sem)[:10]]
     check(
@@ -309,7 +312,7 @@ for q in ["prayer forgiveness", "comparing yourself to others", "aisha"]:
         check(f'"{q}" lexical route → no exception', False, str(e))
 
 try:
-    resp = search("prayer forgiveness", mode="semantic")
+    resp = search("prayer forgiveness", mode="semantic", model=SEMANTIC_MODEL)
     m = meta(resp)
     check(
         '"prayer forgiveness" mode=semantic → route: semantic',
