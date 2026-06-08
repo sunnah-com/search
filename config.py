@@ -28,8 +28,9 @@ def _int_env(name, default):
         return default
 
 
-# Pure lexical index — no embeddings, fast to rebuild.
-LEXICAL_INDEX = "english-mxbai"
+# Pure lexical index — no embeddings, fast to rebuild. Overridable via env so
+# local setups with a differently-named index don't need a code change.
+LEXICAL_INDEX = os.environ.get("LEXICAL_INDEX", "english-lexical")
 
 # Each model gets its own ES index so you can index and switch independently.
 # The semantic field is always called "semantic_text" inside each model's index.
