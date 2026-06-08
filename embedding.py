@@ -47,6 +47,13 @@ _REMOTE_EMBED_BACKOFF_CEILING_S = 60
 # lifecycle states, not real request errors, so we treat them as retryable and
 # wait for a successful probe before fanning batches out at a cold endpoint.
 _HF_TRANSITIONAL_BODY = "workload is not stopped"
+# TEI returns a 500 "input (N tokens) is too large to process. increase the
+# physical batch size (current batch size: …)" when a single input exceeds the
+# endpoint's max_batch_tokens. That's a permanent endpoint-capacity misconfig
+# (fix: redeploy with a larger MAX_BATCH_TOKENS), not a transient error — every
+# over-long doc would fail identically on every retry, so retrying just burns
+# the budget and stretches a doomed run to ~90 min. Treat it as fatal.
+_HF_INPUT_TOO_LARGE_BODY = "too large to process"
 # Cold-start budget: wait up to 10 min for the endpoint to warm up, re-probing
 # every 10s, before fanning embed batches out at it.
 _REMOTE_READY_TIMEOUT_S = 600
@@ -110,10 +117,15 @@ def _remote_failure_retryable(status_code, body):
     429 and 5xx are the usual transient cases. A 400 is normally fatal (bad
     input / model id), except HF's "workload is not stopped" — that's a
     transitional endpoint lifecycle state, not a bad request, so it's retryable.
+    The exception to 5xx is TEI's "too large to process" 500 (input over
+    max_batch_tokens): permanent for that input, so it's fatal, not retryable.
     """
+    body_l = (body or "").lower()
+    if status_code == 500 and _HF_INPUT_TOO_LARGE_BODY in body_l:
+        return False
     if status_code == 429 or 500 <= status_code < 600:
         return True
-    return status_code == 400 and _HF_TRANSITIONAL_BODY in (body or "").lower()
+    return status_code == 400 and _HF_TRANSITIONAL_BODY in body_l
 
 
 def _wait_for_remote_ready(model):
