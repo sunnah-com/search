@@ -59,6 +59,12 @@ _HF_INPUT_TOO_LARGE_BODY = "too large to process"
 _REMOTE_READY_TIMEOUT_S = 600
 _REMOTE_READY_POLL_S = 10
 
+# llama.cpp has no `truncate` field and 500s on inputs over its physical batch
+# (== embeddinggemma's 2048-token context). We clip by characters on failure and
+# halve on a repeat: tokens <= chars, so once the cap drops below 2048 chars it's
+# guaranteed to fit. Starts generous (keeps ~1.5k tokens of typical text).
+_EMBED_MAX_INPUT_CHARS = int(os.environ.get("EMBED_MAX_INPUT_CHARS", "8000"))
+
 # Disk-backed vector cache: persists embedded batches so an interrupted build
 # resumes instead of re-embedding the whole corpus. Defaults on; lives under the
 # app working tree (per-container in prod) and is deleted on a successful build.
@@ -198,11 +204,15 @@ def _embed_via_remote(model, texts, checkpoint=None):
     limiter = RateLimiter(_REMOTE_EMBED_RPM, log=access_log)
 
     def _embed_batch(batch_texts):
-        payload = _remote_payload(cfg, batch_texts)
+        texts = batch_texts
+        char_cap = _EMBED_MAX_INPUT_CHARS
         for attempt in range(_REMOTE_EMBED_MAX_RETRIES):
             limiter.acquire()
             req = urllib.request.Request(
-                cfg["url"], data=payload, headers=headers, method="POST"
+                cfg["url"],
+                data=_remote_payload(cfg, texts),
+                headers=headers,
+                method="POST",
             )
 
             status = None
@@ -217,6 +227,19 @@ def _embed_via_remote(model, texts, checkpoint=None):
                 # Read the body up front — classification needs it (HF signals
                 # the transitional state via a 400 body, not a distinct code).
                 body_snippet = e.read()[:400].decode("utf-8", errors="replace")
+                # An over-long input 500s on llama.cpp; clip the batch and retry,
+                # halving the cap each repeat until it fits (tokens <= chars).
+                if (
+                    e.code == 500
+                    and _HF_INPUT_TOO_LARGE_BODY in body_snippet.lower()
+                    and attempt < _REMOTE_EMBED_MAX_RETRIES - 1
+                ):
+                    texts = [t[:char_cap] for t in texts]
+                    access_log.warning(
+                        "remote_embed_truncated", extra={"char_cap": char_cap}
+                    )
+                    char_cap //= 2
+                    continue
                 retryable = _remote_failure_retryable(e.code, body_snippet)
                 retry_after = e.headers.get("Retry-After")
                 if not retryable or attempt == _REMOTE_EMBED_MAX_RETRIES - 1:
@@ -225,7 +248,7 @@ def _embed_via_remote(model, texts, checkpoint=None):
                         extra={
                             "status": e.code,
                             "body": body_snippet,
-                            "batch_size": len(batch_texts),
+                            "batch_size": len(texts),
                         },
                     )
                     raise
@@ -239,7 +262,7 @@ def _embed_via_remote(model, texts, checkpoint=None):
                         extra={
                             "status": status,
                             "reason": str(e),
-                            "batch_size": len(batch_texts),
+                            "batch_size": len(texts),
                         },
                     )
                     raise
