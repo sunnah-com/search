@@ -51,10 +51,12 @@ services:
       - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
       - cluster.routing.allocation.disk.threshold_enabled=false
       - path.repo=/snapshots
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    mem_limit: 2g
     volumes:
       - ./config/synonyms.txt:/usr/share/elasticsearch/config/synonyms.txt
-      - es-logs:/usr/share/elasticsearch/logs
       - es-data:/usr/share/elasticsearch/data
+      - es-logs:/usr/share/elasticsearch/logs
       - ./data/es-snapshots:/snapshots
     env_file:
       - .env
@@ -101,7 +103,7 @@ networks:
         - subnet: 172.31.250.0/24
 
 volumes:
-  es-logs:
   es-data:
+  es-logs:
   searchdb-data:
 

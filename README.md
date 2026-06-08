@@ -163,6 +163,7 @@ http://<server>:7650/index/status
 | Key | Model | Query-time | Index-time | Dimensions |
 |---|---|---|---|---|
 | `mxbai` | mxbai-embed-large | Ollama (host) | HF Dedicated Endpoint (optional) → else Ollama | 1024 |
+| `mxbai-xsmall` | mxbai-embed-xsmall | Ollama (host) | HF Dedicated Endpoint (optional) → else Ollama | 384 |
 
 Queries are always embedded via **Ollama on the host machine** (not inside Docker) — the container reaches it at `http://host.docker.internal:11434` via ES 8.16's OpenAI-compatible inference endpoint. Index-time embedding is offloaded to a remote TEI endpoint when `HUGGING_FACE_KEY` + `HF_DEDICATED_URL` are set: the indexer fetches vectors over HTTP and ships them inline with the bulk payload (ES's `semantic_text` accepts pre-populated chunks and skips its own inference call). Vectors from TEI and Ollama for the same model are bit-compatible (cosine ≈ 0.9999), so queries can match docs embedded by either side.
 
