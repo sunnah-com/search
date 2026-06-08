@@ -6,10 +6,13 @@
 the raw query string and returns a 3-tuple `(route, variant, extra)`. The `search()`
 handler then branches on `route`.
 
-Rules are applied **in strict priority order** — earlier rules always win:
+Each request passes through a spam check first, then the router. Rules are applied **in strict priority order** — earlier rules always win:
 
 ```
 query string
+    │
+    ├─ spam / junk? (URL, phone number, repeated chars, long token, high symbol density)
+    │       → 400 "invalid query"  (logged as spam_rejected)
     │
     ├─ starts and ends with " " (≥3 chars)?
     │       → route: lexical  │  variant: phrase
@@ -38,14 +41,14 @@ _BOOL_RE   = re.compile(r'\b(AND|OR|NOT)\b')
 def _route_query(query, mode):
     q = query.strip()
     if len(q) >= 3 and q[0] == '"' and q[-1] == '"':
-        return "lexical", "phrase", {"phrase_text": q[1:-1]}
+        return "lexical", "phrase", q[1:-1]
     if _ARABIC_RE.search(q):
-        return "lexical", "arabic", {}
+        return "lexical", "arabic", None
     if _REF_RE.search(q):
-        return "lexical", "reference", {}
+        return "lexical", "reference", None
     if _BOOL_RE.search(q):
-        return "lexical", None, {}
-    return mode, None, {}
+        return "lexical", None, None
+    return mode, None, None
 ```
 
 Priority is absolute. All four rules force `route: lexical` regardless of `?mode=`.
@@ -56,6 +59,24 @@ collection+number query empirically returns 0/9 correct from semantic search.
 
 The boolean rule catches uppercase `AND`/`OR`/`NOT` — ES `query_string` operators that
 semantic search ignores entirely (it just embeds the words and discards the logic).
+
+---
+
+## Spam / junk filter
+
+`_is_spam(query)` runs before `_route_query`. Queries that match return `400 "invalid query"` and are logged as `spam_rejected` — they never hit ES.
+
+| Pattern | Regex / rule | Examples caught |
+|---------|-------------|-----------------|
+| URL | `https?://`, `www.`, `\.[a-z]{3,4}(/\|$)` | `http://example.com`, `visit islam.com` |
+| Phone number | `^[+0-9 ()\-]{7,}$` | `+1 (555) 867-5309`, `+44 20 7946 0000` |
+| Repeated chars | `(.)\1{4,}` (same char 5+ times) | `aaaaaaaa`, `11111111`, `;;;;;;;;` |
+| Long single token | `\S{40,}` (40+ non-space chars) | random hash strings, packed URLs |
+| High symbol density | >40% of non-space chars are non-alphanumeric | `!@#$%^&*()`, `{{{{{{{{` |
+
+Patterns are derived from zero-result query analysis (`search_queries.12may26.sql`).
+Arabic letters count as alphabetic (`.isalpha()` is Unicode-aware), so diacriticised
+Arabic is not penalised by the symbol-density check.
 
 ---
 
@@ -293,6 +314,7 @@ The router is a pure code change — no index rebuild required. The `english-mxb
    ```
 
 2. Review a day of real queries. Focus on:
+   - `message: spam_rejected` — queries blocked before routing. Check the `query` field for false positives (e.g. a valid query that happened to match a spam pattern).
    - `overridden: true` — a rule (phrase/Arabic/number/boolean) blocked a `?mode=semantic` request. Investigate if English conceptual queries appear here unexpectedly.
    - `route: lexical_arabic` on queries that look English — a stray Arabic character in the input will trigger this.
    - `route: lexical_reference` — confirms number-ending and bare-number queries stayed off semantic.
