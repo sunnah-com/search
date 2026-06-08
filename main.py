@@ -712,6 +712,36 @@ _REF_RE = re.compile(r"(^|\s)\d+[a-z]?\s*$", re.IGNORECASE)
 # Semantic embeds AND/OR/NOT as plain text and ignores the logic — keep these on BM25.
 _BOOL_RE = re.compile(r"\b(AND|OR|NOT)\b")
 
+# ── Spam / junk-query detection ──────────────────────────────────────────────
+# Patterns drawn from zero-result query analysis (search_queries.12may26.sql).
+_SPAM_URL_RE = re.compile(r"https?://|www\.|\.[a-z]{3,4}(/|$)", re.IGNORECASE)
+_SPAM_PHONE_RE = re.compile(r"^[+0-9 ()\-]{7,}$")
+_SPAM_REPEAT_RE = re.compile(r"(.)\1{4,}")  # same char 5+ times in a row
+_SPAM_LONGTOKEN_RE = re.compile(r"\S{40,}")  # unbroken 40-char run → no real query
+
+
+def _is_spam(query):
+    """Return True if the query looks like spam/junk rather than a real search."""
+    if not query:
+        return False
+    q = query.strip()
+    if _SPAM_URL_RE.search(q):
+        return True
+    if _SPAM_PHONE_RE.match(q):
+        return True
+    if _SPAM_REPEAT_RE.search(q):
+        return True
+    if _SPAM_LONGTOKEN_RE.search(q):
+        return True
+    # High special-character density: >40% of non-space chars are punctuation/symbols.
+    # .isalpha() handles Arabic and other Unicode letters correctly.
+    non_space = [c for c in q if not c.isspace()]
+    if len(non_space) >= 8:
+        special = sum(1 for c in non_space if not c.isalpha() and not c.isdigit())
+        if special / len(non_space) > 0.4:
+            return True
+    return False
+
 _LOG_ROUTE_VARIANT = {
     "phrase": "lexical_phrase",
     "arabic": "lexical_arabic",
@@ -798,6 +828,11 @@ def malformed_query_response(exc):
 @app.route("/<language>/search", methods=["GET"])
 def search(language):
     query = _truncate_query(request.args.get("q"))
+
+    if _is_spam(query):
+        access_log.info("spam_rejected", extra={"query": query})
+        return jsonify({"error": "invalid query"}), 400
+
     filters = get_filter_from_args(request.args)
     mode = _resolve_mode(request.args)
     size = int(request.args.get("size", 10))
