@@ -1,5 +1,6 @@
 import hashlib
 import random
+import re
 import threading
 import time
 import uuid
@@ -80,6 +81,11 @@ es_client = Elasticsearch(
     request_timeout=10,
 )
 
+
+# When enabled, logs one structured entry per query showing the routing
+# decision: route taken, variant, whether the client mode was overridden.
+# Set ROUTER_LOG=true in .env to turn on. Off by default.
+ROUTER_LOG = _is_truthy(os.environ.get("ROUTER_LOG"))
 
 # Shadow-sampling runtime (sizing constants live in config). The executor and
 # backlog semaphore are live objects, so they're built here where the sampler
@@ -517,7 +523,6 @@ def index():
             ar_docs = [(doc, doc["arabicText"]) for doc in arabicHadiths]
             paired = en_docs + ar_docs
         else:
-            # English-only — replicates colleague's original PR approach.
             paired = [(doc, doc["hadithText"]) for doc in englishHadiths]
 
         model_docs = _attach_semantic_field(paired, model)
@@ -690,11 +695,101 @@ def _truncate_query(query):
 
 def build_semantic_query(query, filter_clauses):
     return {
-        "bool": {
-            "filter": filter_clauses,
-            "must": [{"semantic": {"field": SEMANTIC_FIELD, "query": query}}],
+        "function_score": {
+            "query": {
+                "bool": {
+                    "filter": filter_clauses,
+                    "must": [{"semantic": {"field": SEMANTIC_FIELD, "query": query}}],
+                }
+            },
+            "functions": [
+                {"filter": {"term": {"collection": name}}, "weight": w}
+                for name, w in COLLECTION_BOOSTS
+            ],
+            "score_mode": "sum",
+            "boost_mode": "sum",
         }
     }
+
+
+_ARABIC_RE = re.compile(r"[؀-ۿ]")
+# Ends with a number (with or without preceding text) — "bukhari 1", "abu dawud 200", "5", "42".
+# Forces lexical: semantic returns 0/9 correct for reference-style lookups, and a bare
+# number has no semantic content worth embedding.
+_REF_RE = re.compile(r"(^|\s)\d+[a-z]?\s*$", re.IGNORECASE)
+# Explicit boolean operators in ES query_string syntax.
+# Semantic embeds AND/OR/NOT as plain text and ignores the logic — keep these on BM25.
+_BOOL_RE = re.compile(r"\b(AND|OR|NOT)\b")
+
+# ── Spam / junk-query detection ──────────────────────────────────────────────
+# Patterns drawn from zero-result query analysis (search_queries.12may26.sql).
+# \b (word boundary) instead of (/|$) catches TLDs mid-sentence: "visit buyfc26coins.com now"
+_SPAM_URL_RE = re.compile(r"https?://|www\.|\.[a-z]{3,4}\b", re.IGNORECASE)
+_SPAM_PHONE_RE = re.compile(r"^[+0-9 ()\-]{7,}$")
+_SPAM_REPEAT_RE = re.compile(r"(.)\1{4,}")  # same char 5+ times in a row
+_SPAM_LONGTOKEN_RE = re.compile(r"\S{40,}")  # unbroken 40-char run → no real query
+# Indonesian WhatsApp business spam: "WA 0852 2611 9277 Pasang Interior..."
+_SPAM_WA_RE = re.compile(r"\bWA\s+08")
+
+
+def _is_spam(query):
+    """Return True if the query looks like spam/junk rather than a real search."""
+    if not query:
+        return False
+    q = query.strip()
+    if _SPAM_URL_RE.search(q):
+        return True
+    if _SPAM_PHONE_RE.match(q):
+        return True
+    if _SPAM_REPEAT_RE.search(q):
+        return True
+    if _SPAM_LONGTOKEN_RE.search(q):
+        return True
+    if _SPAM_WA_RE.search(q):
+        return True
+    # High special-character density: >40% of non-space chars are punctuation/symbols.
+    # .isalpha() handles Arabic and other Unicode letters correctly.
+    non_space = [c for c in q if not c.isspace()]
+    if len(non_space) >= 8:
+        special = sum(1 for c in non_space if not c.isalpha() and not c.isdigit())
+        if special / len(non_space) > 0.4:
+            return True
+    return False
+
+_LOG_ROUTE_VARIANT = {
+    "arabic": "lexical_arabic",
+    "reference": "lexical_reference",
+}
+
+def _route_query(query, mode):
+    """Classify the query and return (route, variant).
+
+    route   — "lexical" | mode (passes through for semantic/lexical)
+    variant — None | "arabic" | "reference"
+
+    Rules (applied in order — earlier rules always win):
+      1. Any Arabic character → lexical arabic BM25, full corpus (takes priority over quotes
+         so that quoted Arabic still searches the full corpus, not just English docs)
+      2. Quoted (≥3 chars) → lexical BM25; query_string handles phrase matching natively
+      3. Ends with a number (or IS a number) → lexical reference, forced off semantic
+      4. Contains AND/OR/NOT → lexical BM25 (operator syntax, semantic ignores these)
+      5. Otherwise → mode as requested (lexical BM25 or semantic)
+    """
+    q = query.strip()
+
+    if _ARABIC_RE.search(q):
+        return "lexical", "arabic"
+
+    if len(q) >= 3 and q[0] == '"' and q[-1] == '"':
+        return "lexical", None
+
+    if _REF_RE.search(q):
+        return "lexical", "reference"
+
+    if _BOOL_RE.search(q):
+        return "lexical", None
+
+    return mode, None
 
 
 def get_filter_from_args(args):
@@ -738,10 +833,41 @@ def malformed_query_response(exc):
 @app.route("/<language>/search", methods=["GET"])
 def search(language):
     query = _truncate_query(request.args.get("q"))
+
+    if _is_spam(query):
+        access_log.info("spam_rejected", extra={"query": query})
+        return jsonify({"error": "invalid query"}), 400
+
     filters = get_filter_from_args(request.args)
     mode = _resolve_mode(request.args)
 
-    if mode == SearchMode.SEMANTIC:
+    route, variant = _route_query(query, mode)
+
+    # English route restricts to docs that have hadithText (excludes Arabic-only docs).
+    # lang is stored but not indexed, so we can't term-filter on it — exists on
+    # hadithText is equivalent: English/bilingual docs always have it, Arabic-only never do.
+    # Arabic variant skips this block to search the full corpus.
+    if variant != "arabic" and language == "english":
+        filters = filters + [{"exists": {"field": "hadithText"}}]
+
+    if ROUTER_LOG:
+        log_route = _LOG_ROUTE_VARIANT.get(variant) or ("semantic" if route == SearchMode.SEMANTIC else "lexical")
+        # overridden = True when phrase/arabic/reference forced lexical despite mode=semantic
+        overridden = route == "lexical" and mode == SearchMode.SEMANTIC
+        access_log.info(
+            "router_decision",
+            extra={
+                "request_id": getattr(g, "request_id", None),
+                "query": query,
+                "mode_requested": str(mode),
+                "route": log_route,
+                "variant": variant,
+                "overridden": overridden,
+            },
+        )
+
+    # ── Semantic path ──────────────────────────────────────────────────────────
+    if route == SearchMode.SEMANTIC:
         model_key, err = _resolve_model_key(request.args)
         if err:
             return jsonify({"error": err}), 400
@@ -757,7 +883,13 @@ def search(language):
         )
         return _semantic_search(model, query, filters)
 
-    # Lexical path
+    # ── Lexical paths ──────────────────────────────────────────────────────────
+
+    # Arabic BM25 and standard BM25 share the same cross-fields query structure.
+    # arabicText is mapped with custom_arabic — query_string uses each field's own
+    # analyzer automatically, so Arabic tokens get correct morphological analysis
+    # without explicit annotation. The Arabic route skips the lang filter (full corpus)
+    # and sets _meta.route: lexical_arabic; standard BM25 restricts to lang:en.
     fields = ["hadithNumber^2", "hadithText", "arabicText", "collection^2"]
 
     def build_lexical(query_type):
@@ -796,6 +928,10 @@ def search(language):
         return malformed_query_response(e)
     lexical_ms = (time.perf_counter() - lexical_start) * 1000
 
+    if variant == "arabic":
+        result.body["_meta"] = {"route": "lexical_arabic"}
+        return jsonify(result.body)
+
     _maybe_shadow_sample(
         query,
         filters,
@@ -804,6 +940,8 @@ def search(language):
         result.body,
         lexical_ms,
     )
+    route_tag = "lexical_reference" if variant == "reference" else "lexical"
+    result.body.setdefault("_meta", {})["route"] = route_tag
     return jsonify(result.body)
 
 
@@ -835,6 +973,7 @@ def _semantic_search(model, query, filters):
         )
     except BadRequestError as e:
         return malformed_query_response(e)
+    result.body.setdefault("_meta", {})["route"] = "semantic"
     return jsonify(result.body)
 
 
