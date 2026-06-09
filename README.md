@@ -17,7 +17,7 @@ Browser / PHP website
                       │  english-mxbai         │  mxbai-embed-large vectors
                       └───────────────────────┘
 
-  Ollama (host, port 11434) — embeds search queries
+  Infinity server (host, port 7997) — embeds search queries
   HF Dedicated Endpoint (optional) — embeds documents at index time
 ```
 
@@ -30,7 +30,7 @@ Each index name in ES is an **alias** (e.g. `english-mxbai`) pointing to a times
 ### Prerequisites
 
 - Docker + Docker Compose
-- [Ollama](https://ollama.com) installed and running on your machine
+- [Infinity](https://github.com/michaelf34/infinity) installed and running on your machine
 
 ### 1. Configure environment
 
@@ -38,14 +38,14 @@ Each index name in ES is an **alias** (e.g. `english-mxbai`) pointing to a times
 cp .env.sample .env
 ```
 
-Semantic search is on by default (`SEMANTIC_ENABLED=true`). Set it to `false` if you want lexical-only and don't want to run Ollama. `OLLAMA_URL` defaults to `http://host.docker.internal:11434`, which works on Docker Desktop (Mac/Windows) — leave it unset locally.
+Semantic search is on by default (`SEMANTIC_ENABLED=true`). Set it to `false` if you want lexical-only and don't want to run the Infinity server. `INFINITY_URL` defaults to `http://host.docker.internal:7997`, which works on Docker Desktop (Mac/Windows) — leave it unset locally.
 
-To offload index-time embedding to a HuggingFace Dedicated Inference Endpoint (recommended for prod — orders of magnitude faster on a small GPU than Ollama on a CPU instance), also set `HUGGING_FACE_KEY` and `HF_DEDICATED_URL` in `.env`. The endpoint must run [TEI](https://github.com/huggingface/text-embeddings-inference) with `mixedbread-ai/mxbai-embed-large-v1`. Leaving either var unset falls back to embedding via Ollama at index time too.
+To offload index-time embedding to a HuggingFace Dedicated Inference Endpoint (recommended for prod — orders of magnitude faster on a small GPU than Infinity on a CPU instance), also set `HUGGING_FACE_KEY` and `HF_DEDICATED_URL` in `.env`. The endpoint must run [TEI](https://github.com/huggingface/text-embeddings-inference) with `mixedbread-ai/mxbai-embed-large-v1`. Leaving either var unset falls back to embedding via the Infinity server at index time too.
 
-### 2. Pull the model
+### 2. Serve the model
 
 ```bash
-ollama pull mxbai-embed-large
+infinity_emb v2 --model-id mixedbread-ai/mxbai-embed-xsmall-v1 --port 7997
 ```
 
 ### 3. Start the stack
@@ -62,7 +62,7 @@ Flask is exposed on **port 5000**.
 http://localhost:5000/index?password=index123
 ```
 
-This reads all hadiths from MySQL and builds **both** the lexical and semantic indexes by default — that's almost always what you want. Embedding ~48k English hadiths takes ~9 min via the HF Dedicated Endpoint (or considerably longer through Ollama if no remote endpoint is configured).
+This reads all hadiths from MySQL and builds **both** the lexical and semantic indexes by default — that's almost always what you want. Embedding ~48k English hadiths takes ~9 min via the HF Dedicated Endpoint (or considerably longer through the Infinity server if no remote endpoint is configured).
 
 To build a subset, pass `targets=` (comma-separated):
 ```
@@ -125,15 +125,15 @@ searchdb_password=<password>
 SEARCH_METRICS_SAMPLE_PERCENT=0
 ```
 
-### 2. Ollama on Linux
+### 2. Infinity server on Linux
 
-Install [Ollama](https://ollama.com) on the host and pull the model before starting the stack:
+Run an [Infinity](https://github.com/michaelf34/infinity) server on the host, serving the embedding model, before starting the stack:
 
 ```bash
-ollama pull mxbai-embed-large
+infinity_emb v2 --model-id mixedbread-ai/mxbai-embed-xsmall-v1 --port 7997
 ```
 
-`host.docker.internal` only works on Docker Desktop (Mac/Windows), not on Linux. The prod compose file adds `host-gateway` so this hostname resolves correctly on Linux too — the default `OLLAMA_URL` works without any extra `.env` changes.
+`host.docker.internal` only works on Docker Desktop (Mac/Windows), not on Linux. The prod compose file adds `host-gateway` so this hostname resolves correctly on Linux too — the default `INFINITY_URL` works without any extra `.env` changes.
 
 ### 3. Start the stack
 
@@ -162,17 +162,17 @@ http://<server>:7650/index/status
 
 | Key | Model | Query-time | Index-time | Dimensions |
 |---|---|---|---|---|
-| `mxbai` | mxbai-embed-large | Ollama (host) | HF Dedicated Endpoint (optional) → else Ollama | 1024 |
-| `mxbai-xsmall` | mxbai-embed-xsmall | Ollama (host) | HF Dedicated Endpoint (optional) → else Ollama | 384 |
+| `mxbai` | mxbai-embed-large | Infinity (host) | HF Dedicated Endpoint (optional) → else Infinity | 1024 |
+| `mxbai-xsmall` | mxbai-embed-xsmall | Infinity (host) | HF Dedicated Endpoint (optional) → else Infinity | 384 |
 
-Queries are always embedded via **Ollama on the host machine** (not inside Docker) — the container reaches it at `http://host.docker.internal:11434` via ES 8.16's OpenAI-compatible inference endpoint. Index-time embedding is offloaded to a remote TEI endpoint when `HUGGING_FACE_KEY` + `HF_DEDICATED_URL` are set: the indexer fetches vectors over HTTP and ships them inline with the bulk payload (ES's `semantic_text` accepts pre-populated chunks and skips its own inference call). Vectors from TEI and Ollama for the same model are bit-compatible (cosine ≈ 0.9999), so queries can match docs embedded by either side.
+Queries are always embedded via the **Infinity server on the host machine** (not inside Docker) — the container reaches it at `http://host.docker.internal:7997` via ES 8.16's OpenAI-compatible inference endpoint. Index-time embedding is offloaded to a remote TEI endpoint when `HUGGING_FACE_KEY` + `HF_DEDICATED_URL` are set: the indexer fetches vectors over HTTP and ships them inline with the bulk payload (ES's `semantic_text` accepts pre-populated chunks and skips its own inference call). Vectors from TEI and Infinity for the same model are bit-compatible (cosine ≈ 0.9999), so queries can match docs embedded by either side.
 
 Per-run tuning via env vars: `HF_DEDICATED_CONCURRENCY` (default 4), `HF_DEDICATED_BATCH_SIZE` (default 16, must keep `batch × max_input_length ≤ TEI's max_batch_tokens`), `HF_DEDICATED_RPM` (default -1, disabled).
 
 ### Adding a model
 
 1. Add an entry to `EMBEDDING_MODELS` in `main.py` — copy the mxbai entry as a template (~10 lines).
-2. Pull the model on the Ollama host: `ollama pull your-model-name`.
+2. Serve the model on the Infinity host: `infinity_emb v2 --model-id your-model-name`.
 3. Hit `/index?password=...&targets=newkey` to build its index. (`/index` with no `targets=` will pick it up too, alongside lexical and the other semantic models.)
 4. Add the alias name to `SEMANTIC_INDEXES` in `tests/batch_search.py`.
 5. If it should be the default for `/search?mode=semantic` without a `&model=` param, point `DEFAULT_SEMANTIC_MODEL` at the new key.

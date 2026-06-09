@@ -36,14 +36,17 @@ LEXICAL_INDEX = "english-lexical"
 SEMANTIC_FIELD = "semantic_text"
 
 # Clip the incoming query before it hits either search path. Semantic needs it
-# because Ollama doesn't truncate, so over-long input overflows the model's
+# because the embedding server doesn't truncate, so over-long input overflows the model's
 # context window (400) or burns CPU and stalls the serial embed queue; lexical
 # benefits too, since huge query_strings are pure ES load with no real intent
 # behind them. Real queries are a phrase or two; 1000 chars only clips garbage.
 # Env-tunable — tighten if context-length 400s reappear (e.g. dense scripts).
 QUERY_MAX_CHARS = _int_env("QUERY_MAX_CHARS", 1000)
 
-_OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://host.docker.internal:11434")
+# Infinity embedding server (michaelf34/infinity) — OpenAI-compatible /v1/embeddings.
+# Serves query-time embedding for every semantic model; replaced the CPU-bound Ollama
+# backend that previously handled the non-xsmall models.
+_INFINITY_URL = os.environ.get("INFINITY_URL", "http://host.docker.internal:7997")
 _HUGGING_FACE_KEY = os.environ.get("HUGGING_FACE_KEY")
 # Each remote model needs its own HF Inference Endpoint (one endpoint serves one
 # model), so the URL is per-model. The HF key is shared across them.
@@ -63,7 +66,8 @@ def _build_remote_inference(url, model_id):
 
     The endpoint exposes an OpenAI-compatible /v1/embeddings route that returns
     L2-normalized vectors directly. Returns None (→ fall back to ES inference
-    via Ollama at index time) when the HF key or this model's URL is missing.
+    via the local Infinity server at index time) when the HF key or this model's
+    URL is missing.
     """
     if not (_HUGGING_FACE_KEY and url):
         return None
@@ -99,13 +103,15 @@ EMBEDDING_MODELS = {
         "multilingual": False,
         "dims": 768,  # google/embeddinggemma-300m (QAT int4); same 768-d output as q8
         "prompts": _EMBEDDINGGEMMA_PROMPTS,
-        # ES inference endpoint — always bound to local Ollama (query-time embedding).
-        # Ollama exposes an OpenAI-compatible API; ES 8.16 has no native ollama service.
+        # ES inference endpoint — bound to the local Infinity server (query-time embedding).
+        # Infinity exposes an OpenAI-compatible API; ES 8.16 has no native infinity service.
         "service": "openai",
         "service_settings": {
-            "api_key": "ollama",  # Ollama doesn't require auth; ES requires a non-empty value
-            "url": f"{_OLLAMA_URL}/v1/embeddings",
-            "model_id": "embeddinggemma:300m-qat-q4_0",
+            "api_key": "infinity",  # Infinity doesn't require auth; ES requires a non-empty value
+            "url": f"{_INFINITY_URL}/v1/embeddings",
+            # HF repo Infinity loads (transformers weights); the QAT-q4 checkpoint
+            # dequantized so it isn't GGUF-only like the Ollama tag was.
+            "model_id": "google/embeddinggemma-300m-qat-q4_0-unquantized",
             "similarity": "cosine",
         },
         # Optional remote inference for index time only — see note on mxbai below.
@@ -119,20 +125,20 @@ EMBEDDING_MODELS = {
         "inference_id": "mxbai-embed-large",
         "multilingual": False,
         "dims": 1024,  # mxbai-embed-large(-v1); used for inline chunks
-        # ES inference endpoint — always bound to local Ollama (query-time embedding).
-        # Ollama exposes an OpenAI-compatible API; ES 8.16 has no native ollama service.
+        # ES inference endpoint — bound to the local Infinity server (query-time embedding).
+        # Infinity exposes an OpenAI-compatible API; ES 8.16 has no native infinity service.
         "service": "openai",
         "service_settings": {
-            "api_key": "ollama",  # Ollama doesn't require auth; ES requires a non-empty value
-            "url": f"{_OLLAMA_URL}/v1/embeddings",
-            "model_id": "mxbai-embed-large",
+            "api_key": "infinity",  # Infinity doesn't require auth; ES requires a non-empty value
+            "url": f"{_INFINITY_URL}/v1/embeddings",
+            "model_id": "mixedbread-ai/mxbai-embed-large-v1",
             "similarity": "cosine",
         },
         # Optional remote inference for index time only. When set, the indexer
         # pre-computes vectors via the HF Dedicated Endpoint and ships them
         # inline in the bulk payload (semantic_text accepts pre-populated chunks
         # and skips its own inference call). Query time always goes through the
-        # ES inference endpoint above (local Ollama).
+        # ES inference endpoint above (local Infinity server).
         "remote_inference": _build_remote_inference(_HF_DEDICATED_URL, "mxbai"),
     },
     "mxbai-xsmall": {
@@ -141,15 +147,13 @@ EMBEDDING_MODELS = {
         "inference_id": "mxbai-embed-xsmall",
         "multilingual": False,
         "dims": 384,  # mixedbread-ai/mxbai-embed-xsmall-v1; used for inline chunks
-        # ES inference endpoint — always bound to local Ollama (query-time embedding).
-        # Ollama exposes an OpenAI-compatible API; ES 8.16 has no native ollama service.
+        # ES inference endpoint — bound to the local Infinity server (query-time embedding).
+        # Infinity exposes an OpenAI-compatible API; ES 8.16 has no native infinity service.
         "service": "openai",
         "service_settings": {
-            "api_key": "ollama",  # Ollama doesn't require auth; ES requires a non-empty value
-            "url": f"{_OLLAMA_URL}/v1/embeddings",
-            # Community Ollama upload — no entry in the official library.
-            # Pull with `ollama pull twine/mxbai-embed-xsmall-v1`.
-            "model_id": "twine/mxbai-embed-xsmall-v1",
+            "api_key": "infinity",  # Infinity doesn't require auth; ES requires a non-empty value
+            "url": f"{_INFINITY_URL}/v1/embeddings",
+            "model_id": "mixedbread-ai/mxbai-embed-xsmall-v1",
             "similarity": "cosine",
         },
         # Optional remote inference for index time only — see note on mxbai above.
@@ -214,7 +218,7 @@ _SEARCHDB_CONFIG = {
 }
 
 # Bulk-indexing timeouts. Semantic bulk can be slow because ES embeds each
-# doc against the inference endpoint (Ollama) unless we shipped inline chunks;
+# doc against the inference endpoint (Infinity) unless we shipped inline chunks;
 # lexical bulk is just text ingest and stays fast.
 LEXICAL_BULK_TIMEOUT_S = 60
 SEMANTIC_BULK_TIMEOUT_S = 300

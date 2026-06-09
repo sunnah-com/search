@@ -3,7 +3,7 @@
 When a model has a `remote_inference` config (see config._build_remote_inference),
 the indexer pre-computes vectors here and ships them inline in the bulk payload,
 so ES's semantic_text skips its own inference call. Query-time embedding always
-goes through the ES inference endpoint (local Ollama) and never touches this
+goes through the ES inference endpoint (local Infinity server) and never touches this
 module.
 
 Disk-backed checkpoints let an interrupted build resume instead of re-embedding

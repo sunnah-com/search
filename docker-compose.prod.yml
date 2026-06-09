@@ -21,7 +21,7 @@ services:
       # host.docker.internal resolves automatically on Docker Desktop (Mac/Windows)
       # but not on Linux. host-gateway is Docker's built-in alias for the host's
       # IP on the bridge network, making host.docker.internal work on Linux too.
-      # This is what lets the container reach Ollama running on the host.
+      # This is what lets the container reach the Infinity server running on the host.
       - "host.docker.internal:host-gateway"
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:${ES_STACK_VERSION}
@@ -40,7 +40,7 @@ services:
       - es-logs:/usr/share/elasticsearch/logs
     env_file:
       - .env
-    # ES itself calls Ollama on the host for query/index-time embedding via its
+    # ES itself calls the Infinity server on the host for query/index-time embedding via its
     # OpenAI-compatible inference endpoint, so it also needs host.docker.internal
     # to resolve on Linux (host-gateway = the host's IP on the bridge network).
     # Without this, registering the inference endpoint fails with "Invalid host".

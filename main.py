@@ -150,12 +150,12 @@ def _prepare_documents(documents):
 def _attach_semantic_field(paired, model):
     """Attach SEMANTIC_FIELD as plain text on each doc.
 
-    ES then auto-embeds via the bound inference endpoint (Ollama) at bulk time,
+    ES then auto-embeds via the bound inference endpoint (Infinity) at bulk time,
     unless _rewrite_inline_chunks is called first to pre-populate the field
     with vectors from a remote provider.
 
     The model's document prompt (if any) is baked into the stored text here so it
-    covers BOTH index paths uniformly — the remote embedder and ES→Ollama both
+    covers BOTH index paths uniformly — the remote embedder and ES→Infinity both
     read this field as their embedding input. SEMANTIC_FIELD is excluded from
     _source on every search response, so the prefix is never user-visible. It's
     applied after contentHash is computed (_content_hash skips SEMANTIC_FIELD), so
