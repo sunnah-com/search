@@ -12,26 +12,22 @@ Browser / PHP website
         ▼
   Flask API (this repo)
         │
-        ├── query router (_route_query)
-        │       ├── any Arabic text  → cross_fields BM25 (all docs)    ─┐
-        │       ├── "quoted query"   → cross_fields BM25 (en docs)      │
-        │       ├── ends with number → cross_fields BM25 (en docs)      ├─ english-lexical
-        │       ├── AND / OR / NOT   → cross_fields BM25 (en docs)      │
-        │       └── everything else  → cross_fields BM25 (en docs)     ─┘
+        ├── spam filter (_is_spam) → 400 on URLs, phones, gibberish
         │
-        └── mode=semantic             → kNN       ── english-<model>
-                                                      (semantic_text)
-        └── Elasticsearch
-                ├── english-lexical   — BM25 searches hadithText + arabicText
-                └── english-<model>   — kNN searches semantic_text only
+        └── query router (_route_query)
+                ├── any Arabic text   → BM25, all docs
+                ├── "quoted query"    → BM25, en docs
+                ├── ends with number  → BM25, en docs
+                ├── AND / OR / NOT    → BM25, en docs
+                └── everything else  → follows ?mode=
+                        ├── lexical  → BM25, en docs
+                        └── semantic → kNN,  en docs
 
-  Infinity server (host, port 7997) — embeds search queries
-  HF Dedicated Endpoint (optional) — embeds documents at index time
+  Infinity server (host, port 7997) — embeds queries (semantic path only)
+  HF Dedicated Endpoint (optional)  — embeds documents at index time
 ```
 
-BM25 paths all run against `english-lexical`. Semantic paths run against the index for the active model (e.g. `english-mxbai`, `english-embeddinggemma-qat-q4`). Both index types share the same text fields; the semantic index adds a `semantic_text` vector field.
-
-Each index name in ES is an **alias** (e.g. `english-mxbai`) pointing to a timestamped backing index. Reindexing builds a new backing index and atomically swaps the alias — the live index keeps serving traffic during the rebuild.
+Each index name in ES is an **alias** pointing to a timestamped backing index. Reindexing builds a new backing index and atomically swaps the alias — the live index keeps serving traffic during the rebuild.
 
 ---
 
