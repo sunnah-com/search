@@ -96,12 +96,12 @@ _EMBEDDINGGEMMA_PROMPTS = {
 # Catalog of semantic models. Pure data — no env coupling. Add an entry here
 # to register another model; the on/off switch lives on SEMANTIC_ENABLED above.
 EMBEDDING_MODELS = {
-    "embeddinggemma-qat-q4": {
-        "label": "embeddinggemma-qat-q4",
-        "index": "english-embeddinggemma-qat-q4",
-        "inference_id": "embeddinggemma-qat-q4",
+    "embeddinggemma-q8": {
+        "label": "embeddinggemma-q8",
+        "index": "english-embeddinggemma-q8",
+        "inference_id": "embeddinggemma-q8",
         "multilingual": False,
-        "dims": 768,  # google/embeddinggemma-300m (QAT int4); same 768-d output as q8
+        "dims": 256,  # google/embeddinggemma-300m (QAT int4); same 768-d output as q8
         "prompts": _EMBEDDINGGEMMA_PROMPTS,
         # ES inference endpoint — bound to the local Infinity server (query-time embedding).
         # Infinity exposes an OpenAI-compatible API; ES 8.16 has no native infinity service.
@@ -111,14 +111,10 @@ EMBEDDING_MODELS = {
             "url": f"{_INFINITY_URL}/v1/embeddings",
             # HF repo Infinity loads (transformers weights); the QAT-q4 checkpoint
             # dequantized so it isn't GGUF-only like the Ollama tag was.
-            "model_id": "google/embeddinggemma-300m-qat-q4_0-unquantized",
+            "model_id": "embeddinggemma-q8",
             "similarity": "cosine",
         },
-        # Optional remote inference for index time only — see note on mxbai below.
-        "remote_inference": _build_remote_inference(
-            _HF_DEDICATED_URL_EMBEDDINGGEMMA_QAT, "embeddinggemma-qat-q4"
-        ),
-    },
+     },
     "mxbai": {
         "label": "mxbai-embed-large",
         "index": "english-mxbai",
@@ -171,7 +167,7 @@ _ENABLED_MODELS = EMBEDDING_MODELS if SEMANTIC_ENABLED else {}
 # silently change the default. Validated against the catalog so a typo fails
 # fast at startup instead of KeyError-ing on the first semantic search.
 DEFAULT_SEMANTIC_MODEL = os.environ.get(
-    "DEFAULT_SEMANTIC_MODEL", "embeddinggemma-qat-q4"
+    "DEFAULT_SEMANTIC_MODEL", "embeddinggemma-q8"
 )
 if DEFAULT_SEMANTIC_MODEL not in EMBEDDING_MODELS:
     raise ValueError(
