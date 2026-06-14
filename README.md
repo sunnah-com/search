@@ -10,18 +10,24 @@ Flask + Elasticsearch search service for sunnah.com. Supports lexical (BM25) and
 Browser / PHP website
         │
         ▼
-  Flask API (this repo) ──► Elasticsearch
-                                  │
-                      ┌───────────┴───────────┐
-                      │  english-lexical       │  BM25, no embeddings
-                      │  english-mxbai         │  mxbai-embed-large vectors
-                      └───────────────────────┘
+  Flask API (this repo)
+        │
+        ├── spam filter (_is_spam) → 400 on URLs, phones, gibberish
+        │
+        └── query router (_route_query)
+                ├── any Arabic text   → BM25, all docs
+                ├── "quoted query"    → BM25, en docs
+                ├── ends with number  → BM25, en docs
+                ├── AND / OR / NOT    → BM25, en docs
+                └── everything else  → follows ?mode=
+                        ├── lexical  → BM25, en docs
+                        └── semantic → kNN,  en docs
 
-  Infinity server (host, port 7997) — embeds search queries
-  HF Dedicated Endpoint (optional) — embeds documents at index time
+  Infinity server (host, port 7997) — embeds queries (semantic path only)
+  HF Dedicated Endpoint (optional)  — embeds documents at index time
 ```
 
-Each index name in ES is an **alias** (e.g. `english-mxbai`) pointing to a timestamped backing index. Reindexing builds a new backing index and atomically swaps the alias — the live index keeps serving traffic during the rebuild.
+Each index name in ES is an **alias** pointing to a timestamped backing index. Reindexing builds a new backing index and atomically swaps the alias — the live index keeps serving traffic during the rebuild.
 
 ---
 
@@ -43,6 +49,8 @@ Semantic search is on by default (`SEMANTIC_ENABLED=true`). Set it to `false` if
 To offload index-time embedding to a HuggingFace Dedicated Inference Endpoint (recommended for prod — orders of magnitude faster on a small GPU than Infinity on a CPU instance), also set `HUGGING_FACE_KEY` and `HF_DEDICATED_URL` in `.env`. The endpoint must run [TEI](https://github.com/huggingface/text-embeddings-inference) with `mixedbread-ai/mxbai-embed-large-v1`. Leaving either var unset falls back to embedding via the Infinity server at index time too.
 
 ### 2. Serve the model
+
+Pull whichever embedding model is configured in `EMBEDDING_MODELS` in `main.py`:
 
 ```bash
 infinity_emb v2 --model-id mixedbread-ai/mxbai-embed-xsmall-v1 --port 7997
@@ -66,9 +74,9 @@ This reads all hadiths from MySQL and builds **both** the lexical and semantic i
 
 To build a subset, pass `targets=` (comma-separated):
 ```
-http://localhost:5000/index?password=index123&targets=lexical          # lexical only
-http://localhost:5000/index?password=index123&targets=mxbai            # one semantic model
-http://localhost:5000/index?password=index123&targets=lexical,mxbai    # both (same as default)
+http://localhost:5000/index?password=index123&targets=lexical              # lexical only
+http://localhost:5000/index?password=index123&targets=<model-key>          # one semantic model
+http://localhost:5000/index?password=index123&targets=lexical,<model-key>  # both
 ```
 
 To force a full rebuild instead of incremental:
@@ -149,16 +157,43 @@ The prod stack is exposed on **port 7650**. Builds both lexical and semantic by 
 http://<server>:7650/index?password=<INDEXING_PASSWORD>
 ```
 
-Add `&targets=lexical` or `&targets=mxbai` to build a subset.
+Add `&targets=lexical` or `&targets=<model-key>` to build a subset.
 
 Check index status:
 ```
 http://<server>:7650/index/status
 ```
 
+### Deploying the query router
+
+The query router is a **pure code change** — no index rebuild or schema migration needed. The existing index serves all routes without modification.
+
+**Recommended rollout steps:**
+
+1. **Deploy with `ROUTER_LOG=true`** first. This emits one structured log line per request to the access log, letting you audit routing decisions on real traffic before committing:
+
+   ```env
+   ROUTER_LOG=true
+   ```
+
+   Watch for unexpected `route` values or `overridden: true` cases where user intent doesn't match what the router chose.
+
+2. **Review a day of traffic.** Key things to check:
+   - Arabic queries route to `lexical_arabic` and not falling through to standard BM25.
+   - Quoted queries route to `lexical` (quotes force BM25; `query_string` handles phrase natively).
+   - No legitimate English queries accidentally route to `lexical_arabic` — this happens if a query contains a stray Arabic character. Look for `overridden: true` on queries that look English.
+
+3. **Correlate with shadow sampling** (if `SEARCH_METRICS_SAMPLE_PERCENT > 0`). The `routing_decision` column in `search_metrics` records the route taken alongside lexical and semantic result bodies for each sampled request — useful for comparing what each route returned on the same real queries.
+
+4. **Turn off `ROUTER_LOG`** once routing looks correct. Structured logs are low-overhead but add access log noise on high-traffic servers.
+
+5. **Rollback** is a single `docker compose` redeploy of the previous image. The index is untouched so rollback is instant.
+
 ---
 
 ## Embedding model
+
+The active model(s) are declared in `EMBEDDING_MODELS` in `config.py`. Model selection is under active evaluation — see `tests/small_model_comparison.py` for the comparison script.
 
 | Key | Model | Query-time | Index-time | Dimensions |
 |---|---|---|---|---|
@@ -167,7 +202,7 @@ http://<server>:7650/index/status
 
 Queries are always embedded via the **Infinity server on the host machine** (not inside Docker) — the container reaches it at `http://host.docker.internal:7997` via ES 8.16's OpenAI-compatible inference endpoint. Index-time embedding is offloaded to a remote TEI endpoint when `HUGGING_FACE_KEY` + `HF_DEDICATED_URL` are set: the indexer fetches vectors over HTTP and ships them inline with the bulk payload (ES's `semantic_text` accepts pre-populated chunks and skips its own inference call). Vectors from TEI and Infinity for the same model are bit-compatible (cosine ≈ 0.9999), so queries can match docs embedded by either side.
 
-Per-run tuning via env vars: `HF_DEDICATED_CONCURRENCY` (default 4), `HF_DEDICATED_BATCH_SIZE` (default 16, must keep `batch × max_input_length ≤ TEI's max_batch_tokens`), `HF_DEDICATED_RPM` (default -1, disabled).
+Per-run tuning via env vars: `HF_DEDICATED_CONCURRENCY` (default 4), `HF_DEDICATED_BATCH_SIZE` (default 16), `HF_DEDICATED_RPM` (default -1, disabled).
 
 ### Adding a model
 
@@ -177,17 +212,21 @@ Per-run tuning via env vars: `HF_DEDICATED_CONCURRENCY` (default 4), `HF_DEDICAT
 4. Add the alias name to `SEMANTIC_INDEXES` in `tests/batch_search.py`.
 5. If it should be the default for `/search?mode=semantic` without a `&model=` param, point `DEFAULT_SEMANTIC_MODEL` at the new key.
 
-`SEMANTIC_ENABLED` is a single global toggle — you don't add a per-model env var.
+`SEMANTIC_ENABLED` is a single global toggle — there is no per-model on/off switch.
 
 ---
 
 ## Shadow sampling (semantic rollout)
 
-To roll semantic search out safely, the service can **shadow-sample** live traffic:
-on a random fraction of lexical-served `/search` queries it also runs the semantic
-query in a background thread and records both sides — results and query timings —
-to a `search_metrics` table in a separate **searchdb** (MySQL). The user always
-gets the lexical response, unchanged and undelayed; the semantic run is fire-and-forget.
+On a random fraction of lexical-served `/search` queries the service also runs the
+semantic query in a background thread and records both sides — results and query
+timings — to a `search_metrics` table in a separate **searchdb** (MySQL). The user
+always gets the lexical response, unchanged and undelayed; the semantic run is
+fire-and-forget.
+
+The `routing_decision` column records which query route was taken (`lexical`,
+`lexical_arabic`, `lexical_reference`, `semantic`) so sampled results can be grouped
+and compared by query type.
 
 This produces an apples-to-apples dataset (same real queries, both engines) to
 compare result quality and latency before flipping semantic on for everyone.
@@ -206,12 +245,76 @@ are dropped under load, default 50).
 
 `search_metrics` columns: `query`, `lexical_results` / `semantic_results` (full
 ES response bodies as JSON), `lexical_query_time_ms` / `semantic_query_time_ms`,
-`semantic_model_name`, and `routing_decision` (reserved for a future query router).
+`semantic_model_name`, `routing_decision`.
 
 Locally, the `searchdb` service in `docker-compose.yml` provisions this DB and
 creates the table from `searchdb/01-search_metrics.sql` on first start — no setup
 needed beyond `docker compose up`. In prod, searchdb is an externally-managed DB
 (like the hadith MySQL); just point the `searchdb_*` env vars at it.
+
+---
+
+---
+
+
+## Query routing
+
+Every incoming query is classified by `_route_query()` before any ES call. Rules apply in strict priority order — earlier rules always win and override `?mode=`:
+
+| Priority | Query shape | Route | `_meta.route` | Example |
+|---|---|---|---|---|
+| 1 | Any Arabic Unicode character present | `cross_fields` BM25, full corpus | `lexical_arabic` | `صلاة`, `aisha عائشة` |
+| 2 | Wrapped in double quotes (≥3 chars) | `cross_fields` BM25, forced off semantic | `lexical` | `"angel of death"` |
+| 3 | Ends with a number (`/(^|\s)\d+[a-z]?\s*$/`) | `cross_fields` BM25, forced off semantic | `lexical_reference` | `bukhari 1`, `abu dawud 200`, `42` |
+| 4 | Contains `AND` / `OR` / `NOT` (uppercase) | `cross_fields` BM25, forced off semantic | `lexical` | `prayer AND night` |
+| 5 | Everything else | Client `mode` (`?mode=lexical` or `?mode=semantic`) | `lexical` or `semantic` | `prayer at night` |
+
+**Priority is absolute** — all four lexical rules override `?mode=semantic`.
+
+**Number queries (rule 3):** Any query ending with a number — including bare numbers like `5` or `42` — is forced to lexical. Semantic returns 0/9 correct for collection+number queries in top 10; bare numbers have nothing meaningful to embed. `hadithNumber^2` + `collection^2` boosts surface the correct hadith at rank 1. Misspellings like `bukahri 1` still end with a number and stay on lexical.
+
+**Boolean operators (rule 4):** Uppercase `AND`/`OR`/`NOT` are ES `query_string` operators. Semantic search embeds them as plain text and discards the boolean logic — keeping these on BM25 ensures the operators work as intended.
+
+**Language scoping:** Phrase, lexical, and semantic routes on `/english/search` apply `{"exists": {"field": "hadithText"}}` to exclude Arabic-only docs. The Arabic route skips this filter — Arabic-only docs have `arabicText` but no `hadithText`, so the filter would exclude valid matches. (`lang` is stored but not indexed; exists on `hadithText` is the equivalent filter.)
+
+**`_meta.route`** is present in every response and names the path taken. Facet aggregations (`gradeNorm`, `collection`) and the `isChainRef` exclusion filter are added by downstream branches (corpus-normalization and facets).
+
+### Collection boosts
+
+All routes — lexical (Arabic BM25, reference, standard BM25) and semantic — are wrapped in a `function_score` that adds a flat weight to docs from authoritative collections before the score is summed. When two results have nearly equal BM25 or cosine scores, the boost surfaces the more-authenticated collection.
+
+| Weight | Collections |
+|---|---|
+| 3.5 | Bukhari, Muslim |
+| 3.3 | Nawawi 40, Riyadussalihin |
+| 2.5 | Mishkat, Malik, Ahmad, Tirmidhi |
+| 2.0 | Ibn Majah, Darimi |
+| 1.0 | All others (baseline) |
+
+This lifts the most-authenticated hadiths above identical keyword matches in weaker collections. The boost is additive (`boost_mode: sum`) so a highly-relevant weak-collection hadith can still outrank a barely-relevant Bukhari hadith.
+
+### Standard lexical — query_string fallback
+
+Standard BM25 uses `query_string` first (supports `AND`, `OR`, `-`, field prefixes). If ES rejects the query syntax (unmatched quotes, stray parentheses, reserved operators in unexpected positions), the handler retries automatically with `simple_query_string`, which is lenient and treats the query as plain text. The fallback is logged server-side but not exposed in `_meta`.
+
+### Router audit logging
+
+Set `ROUTER_LOG=true` in `.env` to emit one structured log entry per request:
+
+```json
+{
+  "message": "router_decision",
+  "query": "صلاة الليل",
+  "mode_requested": "semantic",
+  "route": "lexical_arabic",
+  "variant": "arabic",
+  "overridden": true
+}
+```
+
+`overridden: true` means a query rule (phrase, Arabic, number, or boolean) forced a lexical path when `?mode=semantic` was requested. Off by default.
+
+For full ES query shapes, detection code, and known limitations see [`docs/query_router_design.md`](docs/query_router_design.md).
 
 ---
 
@@ -228,7 +331,7 @@ Mode is passed as a query parameter:
 /english/search?q=prayer&mode=lexical
 ```
 
-`mode=semantic` uses the model named in `DEFAULT_SEMANTIC_MODEL` (currently `mxbai`) when no `&model=` is supplied. Pass `&model=<key>` to pick a different enabled model.
+`mode=semantic` uses the model named in `DEFAULT_SEMANTIC_MODEL` when no `&model=` is supplied. Pass `&model=<key>` to pick a different enabled model.
 
 ---
 
