@@ -1,6 +1,5 @@
 import hashlib
 import random
-import re
 import threading
 import time
 import uuid
@@ -38,6 +37,7 @@ from embedding import (
     _open_checkpoint,
     _rewrite_inline_chunks,
 )
+from query_router import is_spam, route_query, routing_decision
 from utils.shortcode_pattern import SHORTCODE_PATTERN
 from utils.vector_checkpoint import list_checkpoints
 
@@ -82,9 +82,9 @@ es_client = Elasticsearch(
 )
 
 
-# When enabled, logs one structured entry per query showing the routing
-# decision: route taken, variant, whether the client mode was overridden.
-# Set ROUTER_LOG=true in .env to turn on. Off by default.
+# When enabled, logs one structured entry per query showing the route the query
+# router *would* take (observational only — routing does not affect the served
+# path; see query_router.py). Set ROUTER_LOG=true in .env to turn on. Off by default.
 ROUTER_LOG = _is_truthy(os.environ.get("ROUTER_LOG"))
 
 # Shadow-sampling runtime (sizing constants live in config). The executor and
@@ -693,15 +693,13 @@ def _truncate_query(query):
     return query[:QUERY_MAX_CHARS]
 
 
-def build_semantic_query(query, filter_clauses):
+def _collection_boosted(must_clause, filter_clauses):
+    """Wrap a single must-clause in bool(filter) + the collection-boost
+    function_score. Shared by the lexical and semantic paths so the boost config
+    (weights, score/boost modes) lives in exactly one place."""
     return {
         "function_score": {
-            "query": {
-                "bool": {
-                    "filter": filter_clauses,
-                    "must": [{"semantic": {"field": SEMANTIC_FIELD, "query": query}}],
-                }
-            },
+            "query": {"bool": {"filter": filter_clauses, "must": [must_clause]}},
             "functions": [
                 {"filter": {"term": {"collection": name}}, "weight": w}
                 for name, w in COLLECTION_BOOSTS
@@ -712,84 +710,10 @@ def build_semantic_query(query, filter_clauses):
     }
 
 
-_ARABIC_RE = re.compile(r"[؀-ۿ]")
-# Ends with a number (with or without preceding text) — "bukhari 1", "abu dawud 200", "5", "42".
-# Forces lexical: semantic returns 0/9 correct for reference-style lookups, and a bare
-# number has no semantic content worth embedding.
-_REF_RE = re.compile(r"(^|\s)\d+[a-z]?\s*$", re.IGNORECASE)
-# Explicit boolean operators in ES query_string syntax.
-# Semantic embeds AND/OR/NOT as plain text and ignores the logic — keep these on BM25.
-_BOOL_RE = re.compile(r"\b(AND|OR|NOT)\b")
-
-# ── Spam / junk-query detection ──────────────────────────────────────────────
-# Patterns drawn from zero-result query analysis (search_queries.12may26.sql).
-# \b (word boundary) instead of (/|$) catches TLDs mid-sentence: "visit buyfc26coins.com now"
-_SPAM_URL_RE = re.compile(r"https?://|www\.|\.[a-z]{3,4}\b", re.IGNORECASE)
-_SPAM_PHONE_RE = re.compile(r"^[+0-9 ()\-]{7,}$")
-_SPAM_REPEAT_RE = re.compile(r"(.)\1{4,}")  # same char 5+ times in a row
-_SPAM_LONGTOKEN_RE = re.compile(r"\S{40,}")  # unbroken 40-char run → no real query
-# Indonesian WhatsApp business spam: "WA 0852 2611 9277 Pasang Interior..."
-_SPAM_WA_RE = re.compile(r"\bWA\s+08")
-
-
-def _is_spam(query):
-    """Return True if the query looks like spam/junk rather than a real search."""
-    if not query:
-        return False
-    q = query.strip()
-    if _SPAM_URL_RE.search(q):
-        return True
-    if _SPAM_PHONE_RE.match(q):
-        return True
-    if _SPAM_REPEAT_RE.search(q):
-        return True
-    if _SPAM_LONGTOKEN_RE.search(q):
-        return True
-    if _SPAM_WA_RE.search(q):
-        return True
-    # High special-character density: >40% of non-space chars are punctuation/symbols.
-    # .isalpha() handles Arabic and other Unicode letters correctly.
-    non_space = [c for c in q if not c.isspace()]
-    if len(non_space) >= 8:
-        special = sum(1 for c in non_space if not c.isalpha() and not c.isdigit())
-        if special / len(non_space) > 0.4:
-            return True
-    return False
-
-_LOG_ROUTE_VARIANT = {
-    "arabic": "lexical_arabic",
-    "reference": "lexical_reference",
-}
-
-def _route_query(query, mode):
-    """Classify the query and return (route, variant).
-
-    route   — "lexical" | mode (passes through for semantic/lexical)
-    variant — None | "arabic" | "reference"
-
-    Rules (applied in order — earlier rules always win):
-      1. Any Arabic character → lexical arabic BM25, full corpus (takes priority over quotes
-         so that quoted Arabic still searches the full corpus, not just English docs)
-      2. Quoted (≥3 chars) → lexical BM25; query_string handles phrase matching natively
-      3. Ends with a number (or IS a number) → lexical reference, forced off semantic
-      4. Contains AND/OR/NOT → lexical BM25 (operator syntax, semantic ignores these)
-      5. Otherwise → mode as requested (lexical BM25 or semantic)
-    """
-    q = query.strip()
-
-    if _ARABIC_RE.search(q):
-        return "lexical", "arabic"
-
-    if len(q) >= 3 and q[0] == '"' and q[-1] == '"':
-        return "lexical", None
-
-    if _REF_RE.search(q):
-        return "lexical", "reference"
-
-    if _BOOL_RE.search(q):
-        return "lexical", None
-
-    return mode, None
+def build_semantic_query(query, filter_clauses):
+    return _collection_boosted(
+        {"semantic": {"field": SEMANTIC_FIELD, "query": query}}, filter_clauses
+    )
 
 
 def get_filter_from_args(args):
@@ -830,44 +754,45 @@ def malformed_query_response(exc):
     return jsonify({"error": "malformed query"}), 400
 
 
+def _log_router_decision(query, mode):
+    """Emit one structured access-log line describing the route the query router
+    would choose. Observational only — does not affect the served path. Gated by
+    ROUTER_LOG; see query_router.py."""
+    _, variant = route_query(query, mode)
+    decision = routing_decision(query, mode)
+    access_log.info(
+        "router_decision",
+        extra={
+            "request_id": getattr(g, "request_id", None),
+            "query": query,
+            "mode_requested": str(mode),
+            "route": decision,
+            "variant": variant,
+            # overridden = router would force lexical despite ?mode=semantic
+            "overridden": mode == SearchMode.SEMANTIC and decision != "semantic",
+        },
+    )
+
+
 @app.route("/<language>/search", methods=["GET"])
 def search(language):
     query = _truncate_query(request.args.get("q"))
 
-    if _is_spam(query):
+    if is_spam(query):
         access_log.info("spam_rejected", extra={"query": query})
         return jsonify({"error": "invalid query"}), 400
 
     filters = get_filter_from_args(request.args)
     mode = _resolve_mode(request.args)
 
-    route, variant = _route_query(query, mode)
-
-    # English route restricts to docs that have hadithText (excludes Arabic-only docs).
-    # lang is stored but not indexed, so we can't term-filter on it — exists on
-    # hadithText is equivalent: English/bilingual docs always have it, Arabic-only never do.
-    # Arabic variant skips this block to search the full corpus.
-    if variant != "arabic" and language == "english":
-        filters = filters + [{"exists": {"field": "hadithText"}}]
-
+    # The query router is observational for now: it does not change the served
+    # path. Production routes purely on ?mode=; the router's decision is only
+    # logged here and recorded in shadow-sampling metrics (see _maybe_shadow_sample).
     if ROUTER_LOG:
-        log_route = _LOG_ROUTE_VARIANT.get(variant) or ("semantic" if route == SearchMode.SEMANTIC else "lexical")
-        # overridden = True when phrase/arabic/reference forced lexical despite mode=semantic
-        overridden = route == "lexical" and mode == SearchMode.SEMANTIC
-        access_log.info(
-            "router_decision",
-            extra={
-                "request_id": getattr(g, "request_id", None),
-                "query": query,
-                "mode_requested": str(mode),
-                "route": log_route,
-                "variant": variant,
-                "overridden": overridden,
-            },
-        )
+        _log_router_decision(query, mode)
 
     # ── Semantic path ──────────────────────────────────────────────────────────
-    if route == SearchMode.SEMANTIC:
+    if mode == SearchMode.SEMANTIC:
         model_key, err = _resolve_model_key(request.args)
         if err:
             return jsonify({"error": err}), 400
@@ -883,30 +808,18 @@ def search(language):
         )
         return _semantic_search(model, query, filters)
 
-    # ── Lexical paths ──────────────────────────────────────────────────────────
+    # ── Lexical path ─────────────────────────────────────────────────────────
 
-    # Arabic BM25 and standard BM25 share the same cross-fields query structure.
-    # arabicText is mapped with custom_arabic — query_string uses each field's own
-    # analyzer automatically, so Arabic tokens get correct morphological analysis
-    # without explicit annotation. The Arabic route skips the lang filter (full corpus)
-    # and sets _meta.route: lexical_arabic; standard BM25 restricts to lang:en.
+    # cross_fields BM25 — query_string uses each field's own analyzer automatically,
+    # so Arabic tokens in arabicText get correct morphological analysis without
+    # explicit annotation.
     fields = ["hadithNumber^2", "hadithText", "arabicText", "collection^2"]
 
     def build_lexical(query_type):
         inner = {"query": query, "fields": fields}
         if query_type == "query_string":
             inner["type"] = "cross_fields"
-        return {
-            "function_score": {
-                "query": {"bool": {"filter": filters, "must": [{query_type: inner}]}},
-                "functions": [
-                    {"filter": {"term": {"collection": name}}, "weight": w}
-                    for name, w in COLLECTION_BOOSTS
-                ],
-                "score_mode": "sum",
-                "boost_mode": "sum",
-            }
-        }
+        return _collection_boosted({query_type: inner}, filters)
 
     kwargs = {
         "index": LEXICAL_INDEX,
@@ -928,10 +841,6 @@ def search(language):
         return malformed_query_response(e)
     lexical_ms = (time.perf_counter() - lexical_start) * 1000
 
-    if variant == "arabic":
-        result.body["_meta"] = {"route": "lexical_arabic"}
-        return jsonify(result.body)
-
     _maybe_shadow_sample(
         query,
         filters,
@@ -939,9 +848,9 @@ def search(language):
         request.args.get("size", 10),
         result.body,
         lexical_ms,
+        mode,
     )
-    route_tag = "lexical_reference" if variant == "reference" else "lexical"
-    result.body.setdefault("_meta", {})["route"] = route_tag
+    result.body.setdefault("_meta", {})["route"] = "lexical"
     return jsonify(result.body)
 
 
@@ -1038,7 +947,9 @@ def _persist_search_metrics(
         conn.close()
 
 
-def _shadow_sample_task(query, filters, from_, size, lexical_body, lexical_ms):
+def _shadow_sample_task(
+    query, filters, from_, size, lexical_body, lexical_ms, routing_decision
+):
     """Background task: run the semantic side and persist both results. Swallows
     every error — shadow telemetry must never affect the served request, and it
     already returned by the time this runs."""
@@ -1054,6 +965,7 @@ def _shadow_sample_task(query, filters, from_, size, lexical_body, lexical_ms):
             semantic_body,
             semantic_ms,
             model["label"],
+            routing_decision,
         )
     except Exception:
         access_log.exception("shadow_sample_failed", extra={"query": query})
@@ -1061,9 +973,12 @@ def _shadow_sample_task(query, filters, from_, size, lexical_body, lexical_ms):
         _shadow_slots.release()
 
 
-def _maybe_shadow_sample(query, filters, from_, size, lexical_body, lexical_ms):
+def _maybe_shadow_sample(query, filters, from_, size, lexical_body, lexical_ms, mode):
     """Roll the dice on a lexical-served query and, if it wins, hand the semantic
-    comparison off to the background pool. Returns immediately; never raises."""
+    comparison off to the background pool. Returns immediately; never raises.
+
+    The query router's decision for this query is recorded in the sample's
+    routing_decision column (observational — it did not affect the served path)."""
     if not query or not _shadow_sampling_enabled():
         return
     if random.randint(1, 100) > SEARCH_METRICS_SAMPLE_PERCENT:
@@ -1071,9 +986,17 @@ def _maybe_shadow_sample(query, filters, from_, size, lexical_body, lexical_ms):
     if not _shadow_slots.acquire(blocking=False):
         access_log.warning("shadow_sample_dropped")
         return
+    decision = routing_decision(query, mode)
     try:
         _SHADOW_EXECUTOR.submit(
-            _shadow_sample_task, query, filters, from_, size, lexical_body, lexical_ms
+            _shadow_sample_task,
+            query,
+            filters,
+            from_,
+            size,
+            lexical_body,
+            lexical_ms,
+            decision,
         )
     except RuntimeError:
         # Executor shutting down (e.g. interpreter exit) — release the slot.
