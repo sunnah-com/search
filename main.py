@@ -716,6 +716,36 @@ def build_semantic_query(query, filter_clauses):
     )
 
 
+# Fields the frontend renders highlights for; shared by both search paths.
+HIGHLIGHT_FIELDS = {"hadithText": {}, "arabicText": {}, "collection": {}}
+
+
+def _lexical_inner(query, query_type):
+    """query_type is "query_string" (strict, for ranking) or "simple_query_string"
+    (lenient, used as ranking fallback and for highlight queries)."""
+    # cross_fields lets each field use its own analyzer (e.g. Arabic morphology).
+    fields = ["hadithNumber^2", "hadithText", "arabicText", "collection^2"]
+    inner = {"query": query, "fields": fields}
+    if query_type == "query_string":
+        inner["type"] = "cross_fields"
+    return {query_type: inner}
+
+
+def build_lexical_query(query, query_type, filter_clauses):
+    return _collection_boosted(_lexical_inner(query, query_type), filter_clauses)
+
+
+def _highlight(highlight_query=None):
+    """Shared highlight config. number_of_fragments=0 returns the whole field. The
+    semantic path passes highlight_query to highlight literal terms on semantic hits
+    (the semantic index carries the same analyzed fields); the lexical path's own
+    query already drives highlighting."""
+    block = {"number_of_fragments": 0, "fields": HIGHLIGHT_FIELDS}
+    if highlight_query is not None:
+        block["highlight_query"] = highlight_query
+    return block
+
+
 def get_filter_from_args(args):
     filters = []
     if collection := args.getlist("collection"):
@@ -810,33 +840,11 @@ def search(language):
 
     # ── Lexical path ─────────────────────────────────────────────────────────
 
-    # cross_fields BM25 — query_string uses each field's own analyzer automatically,
-    # so Arabic tokens in arabicText get correct morphological analysis without
-    # explicit annotation.
-    fields = ["hadithNumber^2", "hadithText", "arabicText", "collection^2"]
-
-    def build_lexical(query_type):
-        inner = {"query": query, "fields": fields}
-        if query_type == "query_string":
-            inner["type"] = "cross_fields"
-        return _collection_boosted({query_type: inner}, filters)
-
-    kwargs = {
-        "index": LEXICAL_INDEX,
-        "from_": request.args.get("from", 0),
-        "size": request.args.get("size", 10),
-        "_source": {"excludes": [SEMANTIC_FIELD]},
-        "highlight": {"number_of_fragments": 0, "fields": {"*": {}}},
-        "suggest": get_suggest_block(query),
-    }
     lexical_start = time.perf_counter()
     try:
-        try:
-            result = es_client.search(query=build_lexical("query_string"), **kwargs)
-        except BadRequestError:
-            result = es_client.search(
-                query=build_lexical("simple_query_string"), **kwargs
-            )
+        result = _execute_lexical_search(
+            query, filters, request.args.get("from", 0), request.args.get("size", 10)
+        )
     except BadRequestError as e:
         return malformed_query_response(e)
     lexical_ms = (time.perf_counter() - lexical_start) * 1000
@@ -854,13 +862,33 @@ def search(language):
     return jsonify(result.body)
 
 
-def _execute_semantic_search(model, query, filters, from_, size):
-    """Run the semantic ES query. Shared by the request route and the shadow
-    sampler so the query shape (timeout, source excludes, suggest) lives once.
+def _execute_lexical_search(query, filters, from_, size):
+    """Lexical BM25 query, falling back to simple_query_string on syntax the strict
+    parser rejects. Shared by the lexical route and the semantic fallback path; a
+    BadRequestError from the fallback propagates for callers to map."""
+    kwargs = {
+        "index": LEXICAL_INDEX,
+        "from_": from_,
+        "size": size,
+        "_source": {"excludes": [SEMANTIC_FIELD]},
+        "highlight": _highlight(),
+        "suggest": get_suggest_block(query),
+    }
+    try:
+        return es_client.search(
+            query=build_lexical_query(query, "query_string", filters), **kwargs
+        )
+    except BadRequestError:
+        return es_client.search(
+            query=build_lexical_query(query, "simple_query_string", filters), **kwargs
+        )
 
-    The model's query prompt is applied only to the text ES embeds; the raw query
-    still feeds get_suggest_block so spelling suggestions aren't built from the
-    instruction prefix."""
+
+def _execute_semantic_search(model, query, filters, from_, size):
+    """Semantic ES query, shared by the request route and the shadow sampler. The
+    model's query prompt is applied only to the embedded text; the raw query still
+    feeds get_suggest_block so suggestions aren't built from the instruction prefix.
+    Highlights use a literal-term highlight_query so semantic hits carry them too."""
     return es_client.options(request_timeout=130).search(
         index=model["index"],
         from_=int(from_),
@@ -868,21 +896,26 @@ def _execute_semantic_search(model, query, filters, from_, size):
         query=build_semantic_query(_apply_prompt(model, "query", query), filters),
         _source={"excludes": [SEMANTIC_FIELD]},
         suggest=get_suggest_block(query),
+        highlight=_highlight(_lexical_inner(query, "simple_query_string")),
     )
 
 
 def _semantic_search(model, query, filters):
+    from_ = request.args.get("from", 0)
+    size = request.args.get("size", 10)
+    route = "semantic"
     try:
-        result = _execute_semantic_search(
-            model,
-            query,
-            filters,
-            request.args.get("from", 0),
-            request.args.get("size", 10),
-        )
-    except BadRequestError as e:
-        return malformed_query_response(e)
-    result.body.setdefault("_meta", {})["route"] = "semantic"
+        result = _execute_semantic_search(model, query, filters, from_, size)
+    except Exception:
+        # Degrade gracefully: any semantic failure (inference endpoint down,
+        # timeout, etc.) falls back to lexical so the user still gets results.
+        access_log.exception("semantic_search_failed", extra={"query": query})
+        try:
+            result = _execute_lexical_search(query, filters, from_, size)
+        except BadRequestError as e:
+            return malformed_query_response(e)
+        route = "lexical_fallback"
+    result.body.setdefault("_meta", {})["route"] = route
     return jsonify(result.body)
 
 
