@@ -153,9 +153,9 @@ EMBEDDING_MODELS = {
             "similarity": "cosine",
         },
         # Optional remote inference for index time only — see note on mxbai above.
-        "remote_inference": _build_remote_inference(
-            _HF_DEDICATED_URL_MXBAI_XSMALL, "mxbai-xsmall"
-        ),
+        # "remote_inference": _build_remote_inference(
+        #     _HF_DEDICATED_URL_MXBAI_XSMALL, "mxbai-xsmall"
+        # ),
     },
 }
 
