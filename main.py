@@ -900,6 +900,14 @@ def _shadow_sampling_enabled():
     )
 
 
+def _result_urns(body):
+    """Ordered list of hadith URNs from an ES response body. Hit `_id`s are
+    `lang:urn` (see _prepare_documents); we keep just the urn, in result order.
+    Used to record shadow samples compactly instead of full result bodies."""
+    hits = (body or {}).get("hits", {}).get("hits", [])
+    return [hit.get("_id", "").split(":", 1)[-1] for hit in hits]
+
+
 def _run_semantic_shadow(model, query, filters, from_, size):
     """Run the semantic query for comparison. Returns (result_body, elapsed_ms).
 
@@ -921,8 +929,10 @@ def _persist_search_metrics(
     model_name,
     routing_decision=None,
 ):
-    """Insert one row into search_metrics. Opens a fresh connection per write —
-    sampled volume is low, so a pool isn't worth the added lifecycle."""
+    """Insert one row into search_metrics. The result bodies are reduced to their
+    ordered URN lists (see _result_urns) before storage — recording full result
+    bodies took far too much space. Opens a fresh connection per write — sampled
+    volume is low, so a pool isn't worth the added lifecycle."""
     conn = pymysql.connect(charset="utf8mb4", **_SEARCHDB_CONFIG)
     try:
         with conn.cursor() as cursor:
@@ -934,9 +944,9 @@ def _persist_search_metrics(
                    VALUES (%s, %s, %s, %s, %s, %s, %s)""",
                 (
                     query,
-                    json.dumps(lexical_results, ensure_ascii=False, default=str),
+                    json.dumps(_result_urns(lexical_results), ensure_ascii=False),
                     round(lexical_ms, 3),
-                    json.dumps(semantic_results, ensure_ascii=False, default=str),
+                    json.dumps(_result_urns(semantic_results), ensure_ascii=False),
                     round(semantic_ms, 3),
                     model_name,
                     routing_decision,
