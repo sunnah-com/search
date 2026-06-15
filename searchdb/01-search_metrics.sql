@@ -4,6 +4,7 @@
 CREATE TABLE IF NOT EXISTS search_metrics (
     id                     BIGINT        NOT NULL AUTO_INCREMENT PRIMARY KEY,
     query                  TEXT          NOT NULL,
+    query_from             INT           NULL,
     lexical_results        JSON          NOT NULL,
     lexical_query_time_ms  DECIMAL(12,3) NOT NULL,
     semantic_results       JSON          NOT NULL,

@@ -955,6 +955,7 @@ def _run_semantic_shadow(model, query, filters, from_, size):
 
 def _persist_search_metrics(
     query,
+    query_from,
     lexical_results,
     lexical_ms,
     semantic_results,
@@ -971,12 +972,13 @@ def _persist_search_metrics(
         with conn.cursor() as cursor:
             cursor.execute(
                 """INSERT INTO search_metrics
-                       (query, lexical_results, lexical_query_time_ms,
+                       (query, query_from, lexical_results, lexical_query_time_ms,
                         semantic_results, semantic_query_time_ms,
                         semantic_model_name, routing_decision)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
                     query,
+                    int(query_from),
                     json.dumps(_result_urns(lexical_results), ensure_ascii=False),
                     round(lexical_ms, 3),
                     json.dumps(_result_urns(semantic_results), ensure_ascii=False),
@@ -1003,6 +1005,7 @@ def _shadow_sample_task(
         )
         _persist_search_metrics(
             query,
+            from_,
             lexical_body,
             lexical_ms,
             semantic_body,
