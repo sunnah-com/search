@@ -68,10 +68,16 @@ _VARIANT_LABEL = {
 
 
 def route_query(query, mode):
-    """Classify the query and return (route, variant).
+    """Classify the query and return (route, variant) — the route the router
+    *recommends*, independent of the requested ``mode``.
 
-    route   — "lexical" | mode (passes through for semantic/lexical)
+    route   — "lexical" | SearchMode.SEMANTIC
     variant — None | "arabic" | "reference"
+
+    The recommendation does not consult ``mode``: this is observational, so the
+    point is to record what the router would pick, not to echo what the caller
+    asked for. (``mode`` is retained in the signature for call-site symmetry with
+    the requested-mode logging.)
 
     Rules (applied in order — earlier rules always win):
       1. Any Arabic character → lexical arabic BM25, full corpus (takes priority over quotes
@@ -79,7 +85,7 @@ def route_query(query, mode):
       2. Quoted (≥3 chars) → lexical BM25; query_string handles phrase matching natively
       3. Ends with a number (or IS a number) → lexical reference, forced off semantic
       4. Contains AND/OR/NOT → lexical BM25 (operator syntax, semantic ignores these)
-      5. Otherwise → mode as requested (lexical BM25 or semantic)
+      5. Otherwise → semantic (a plain natural-language query is what semantic is for)
     """
     q = (query or "").strip()
 
@@ -95,7 +101,7 @@ def route_query(query, mode):
     if _BOOL_RE.search(q):
         return "lexical", None
 
-    return mode, None
+    return SearchMode.SEMANTIC, None
 
 
 def routing_decision(query, mode):

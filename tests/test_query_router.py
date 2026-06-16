@@ -43,9 +43,11 @@ class RouteQueryTests(unittest.TestCase):
         for q in ("prayer AND night", "bukhari OR muslim", "prayer NOT shirk"):
             self.assertEqual(route_query(q, SEM), ("lexical", None))
 
-    def test_passthrough_respects_mode(self):
+    def test_plain_query_recommends_semantic_regardless_of_mode(self):
+        # A plain natural-language query hits none of the lexical-forcing rules,
+        # so the router recommends semantic even when lexical was requested.
         self.assertEqual(route_query("prayer at night", SEM), (SEM, None))
-        self.assertEqual(route_query("prayer at night", LEX), (LEX, None))
+        self.assertEqual(route_query("prayer at night", LEX), (SEM, None))
 
 
 class PriorityTests(unittest.TestCase):
@@ -76,7 +78,9 @@ class RoutingDecisionLabelTests(unittest.TestCase):
             ('"angel of death"', SEM, "lexical"),
             ("prayer AND night", SEM, "lexical"),
             ("prayer at night", SEM, "semantic"),
-            ("prayer at night", LEX, "lexical"),
+            # Recommendation is independent of requested mode — this is the case
+            # that was previously impossible to observe in lexical-served samples.
+            ("prayer at night", LEX, "semantic"),
         ]
         for q, mode, expected in cases:
             self.assertEqual(routing_decision(q, mode), expected, q)
