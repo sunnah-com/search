@@ -14,6 +14,7 @@ See docs/query_router_design.md.
 """
 
 import re
+import unicodedata
 
 from config import SearchMode
 
@@ -44,10 +45,15 @@ def is_spam(query):
     if _SPAM_WA_RE.search(q):
         return True
     # High special-character density: >40% of non-space chars are punctuation/symbols.
-    # .isalpha() handles Arabic and other Unicode letters correctly.
+    # Exclude Unicode combining marks (Mn) — Arabic diacritics (harakat) are Mn
+    # and are part of the word, not punctuation. Without this, heavily voweled
+    # Arabic like "اللَّهُمَّ صَلِّ عَلَى مُحَمَّدٍ" exceeds the threshold and is
+    # wrongly rejected.
     non_space = [c for c in q if not c.isspace()]
     if len(non_space) >= 8:
-        special = sum(1 for c in non_space if not c.isalpha() and not c.isdigit())
+        special = sum(1 for c in non_space
+                      if not c.isalpha() and not c.isdigit()
+                      and unicodedata.category(c) != 'Mn')
         if special / len(non_space) > 0.4:
             return True
     return False
