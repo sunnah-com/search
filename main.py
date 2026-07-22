@@ -804,8 +804,11 @@ def _log_router_decision(query, mode):
     )
 
 
+# The <language> segment is ignored (indexes are unified across languages); it is
+# kept only as an optional prefix for the legacy PHP site (/english/search).
+@app.route("/search", methods=["GET"])
 @app.route("/<language>/search", methods=["GET"])
-def search(language):
+def search(language=None):
     query = _truncate_query(request.args.get("q"))
 
     if is_spam(query):
