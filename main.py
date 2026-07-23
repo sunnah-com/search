@@ -260,6 +260,26 @@ def _make_settings():
     }
 
 
+# Collection/book columns baked into each doc's `meta` for the frontend to
+# compute references, grades, and book names from (see the index build).
+_COLLECTION_META_FIELDS = (
+    "name", "englishTitle", "arabicTitle", "hasvolumes", "hasbooks", "haschapters",
+    "englishgrade1", "arabicgrade1", "showInBookReference", "showEnglishTranslationNumber",
+    "status", "reference_template",
+)
+_BOOK_META_FIELDS = (
+    "ourBookID", "ourBookNum", "status", "englishBookName", "arabicBookName",
+    "reference_template", "linkpath",
+)
+
+
+def _pick(row, fields):
+    """Project a source row to the given fields (None if the row is missing)."""
+    if row is None:
+        return None
+    return {field: row.get(field) for field in fields}
+
+
 def _make_mappings(non_indexed_fields, model=None):
     props = {field: {"type": "text", "index": False} for field in non_indexed_fields}
     props["hadithText"] = {
@@ -272,6 +292,9 @@ def _make_mappings(non_indexed_fields, model=None):
     # Reconstruction payloads: kept in _source, kept out of the index entirely.
     props["en"] = {"type": "object", "enabled": False}
     props["ar"] = {"type": "object", "enabled": False}
+    # Collection/book metadata baked in for the frontend to compute references,
+    # grades, and book names from — also _source-only, never indexed.
+    props["meta"] = {"type": "object", "enabled": False}
     if model:
         props[SEMANTIC_FIELD] = {
             "type": "semantic_text",
@@ -424,6 +447,27 @@ def index():
         database=os.environ.get("MYSQL_DATABASE"),
     )
     cursor = connection.cursor(pymysql.cursors.DictCursor)
+
+    # Collection + book metadata, loaded once and baked into each doc's `meta`
+    # so the frontend can compute references/grades/book-names at render time
+    # without any query-time database lookup. bookID columns are DECIMAL — cast
+    # to CHAR so they match the hadith rows' CAST(bookID AS CHAR) keys ("2.0").
+    cursor.execute("SELECT * FROM Collections")
+    collections_by_name = {row["name"]: row for row in cursor.fetchall()}
+    cursor.execute(
+        "SELECT *, CAST(arabicBookID AS CHAR) AS arabicBookID_c, "
+        "CAST(englishBookID AS CHAR) AS englishBookID_c FROM BookData"
+    )
+    book_rows = cursor.fetchall()
+    books_by_arabic = {(r["collection"], r["arabicBookID_c"]): r for r in book_rows}
+    books_by_english = {(r["collection"], r["englishBookID_c"]): r for r in book_rows}
+
+    def _doc_meta(collection_slug, book_row):
+        return {
+            "collection": _pick(collections_by_name.get(collection_slug), _COLLECTION_META_FIELDS),
+            "book": _pick(book_row, _BOOK_META_FIELDS),
+        }
+
     # Filter out empty rows at the source so the rest of the pipeline doesn't
     # have to handle them — TEI rejects empty inputs, ES wastes an _id storing
     # them, and a hadith with no text can't match any query anyway.
@@ -455,6 +499,7 @@ def index():
             "arabicText": hadith["hadithText"],
             "grade": hadith["grade1"],
             "ar": ar_obj,
+            "meta": _doc_meta(hadith["collection"], books_by_arabic.get((hadith["collection"], hadith["bookID"]))),
         }
         arabicHadiths.append(doc)
         if hadith["matchingEnglishURN"] == 0:
@@ -480,6 +525,7 @@ def index():
             "hadithText": hadith["hadithText"],
             "grade": hadith["grade1"],
             "en": dict(hadith),
+            "meta": _doc_meta(hadith["collection"], books_by_english.get((hadith["collection"], hadith["bookID"]))),
         }
         # Fold in the matching Arabic side → one bilingual doc. Arabic
         # hadithNumber stays top-level to preserve search ranking (hadithNumber^2).
